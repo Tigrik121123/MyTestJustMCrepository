@@ -1,5 +1,5 @@
 {
-    'text':'test',
-    'ver':'version_0.1',
-    'date':'30-04-2025'
+    "text":"test",
+    "ver":"version_0.1",
+    "date":"30-04-2025"
 }
