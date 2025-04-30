@@ -1,5 +1,191 @@
-{
-    "text":"test",
-    "ver":"version_0.1",
-    "date":"30-04-2025"
+package com.yourdomain.telegramnotifier; // Замените на ваш пакет!
+
+import org.bukkit.Bukkit;
+import org.bukkit.ChatColor;
+import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.entity.Player;
+import org.bukkit.event.EventHandler;
+import org.bukkit.event.Listener;
+import org.bukkit.event.player.AsyncPlayerChatEvent;
+import org.bukkit.event.player.PlayerJoinEvent;
+import org.bukkit.event.player.PlayerQuitEvent;
+import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.scheduler.BukkitRunnable;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.net.URLEncoder;
+import java.nio.charset.StandardCharsets;
+import java.util.logging.Level;
+
+public class TelegramNotifier extends JavaPlugin implements Listener {
+
+    private String botToken;
+    private String chatId;
+    private boolean enabledFeatures_Chat = true;
+    private boolean enabledFeatures_Join = true;
+    private boolean enabledFeatures_Quit = true;
+    private boolean enabledFeatures_ServerStatus = true;
+
+    @Override
+    public void onEnable() {
+        // Создание и загрузка конфигурации
+        saveDefaultConfig(); // Сохраняет config.yml из jar, если его нет
+        loadConfigValues();
+
+        if (botToken == null || botToken.isEmpty() || botToken.equals("YOUR_BOT_TOKEN") ||
+            chatId == null || chatId.isEmpty() || chatId.equals("YOUR_CHAT_ID")) {
+            getLogger().severe("!!! Telegram Bot Token или Chat ID не настроены в config.yml!");
+            getLogger().severe("!!! Плагин TelegramNotifier не будет отправлять сообщения.");
+            // Можно отключить плагин, если конфигурация неверна
+            // Bukkit.getPluginManager().disablePlugin(this);
+            // return;
+        } else {
+             getLogger().info("TelegramNotifier включен!");
+        }
+
+        // Регистрация слушателя событий
+        getServer().getPluginManager().registerEvents(this, this);
+
+        // Отправка сообщения о запуске сервера (если включено)
+        if (enabledFeatures_ServerStatus) {
+            sendMessageToTelegramAsync("✅ Сервер запущен!");
+        }
+    }
+
+    @Override
+    public void onDisable() {
+         // Отправка сообщения об остановке сервера (если включено)
+        // Делаем синхронно, т.к. сервер выключается
+        if (enabledFeatures_ServerStatus && botToken != null && !botToken.isEmpty() && chatId != null && !chatId.isEmpty()) {
+             sendMessageToTelegramSync("🛑 Сервер остановлен!");
+        }
+         getLogger().info("TelegramNotifier выключен.");
+    }
+
+    private void loadConfigValues() {
+        FileConfiguration config = getConfig();
+        botToken = config.getString("telegram.bot-token");
+        chatId = config.getString("telegram.chat-id");
+        enabledFeatures_Chat = config.getBoolean("enabled-features.chat", true);
+        enabledFeatures_Join = config.getBoolean("enabled-features.join", true);
+        enabledFeatures_Quit = config.getBoolean("enabled-features.quit", true);
+        enabledFeatures_ServerStatus = config.getBoolean("enabled-features.server-status", true);
+    }
+
+    // --- Слушатели Событий ---
+
+    @EventHandler
+    public void onPlayerChat(AsyncPlayerChatEvent event) {
+        if (!enabledFeatures_Chat) return;
+
+        Player player = event.getPlayer();
+        String message = event.getMessage();
+        // Экранируем HTML теги для безопасности в Telegram
+        String formattedMessage = "[💬] " + escapeHtml(player.getName()) + ": " + escapeHtml(message);
+        sendMessageToTelegramAsync(formattedMessage);
+    }
+
+    @EventHandler
+    public void onPlayerJoin(PlayerJoinEvent event) {
+        if (!enabledFeatures_Join) return;
+
+        Player player = event.getPlayer();
+        String formattedMessage = "[➕] Игрок " + escapeHtml(player.getName()) + " вошел на сервер.";
+        sendMessageToTelegramAsync(formattedMessage);
+    }
+
+    @EventHandler
+    public void onPlayerQuit(PlayerQuitEvent event) {
+        if (!enabledFeatures_Quit) return;
+
+        Player player = event.getPlayer();
+        String formattedMessage = "[➖] Игрок " + escapeHtml(player.getName()) + " вышел с сервера.";
+        sendMessageToTelegramAsync(formattedMessage);
+    }
+
+    // --- Отправка сообщений в Telegram ---
+
+    private void sendMessageToTelegramAsync(String message) {
+        if (botToken == null || botToken.isEmpty() || chatId == null || chatId.isEmpty()) {
+            // Не отправляем, если конфиг не настроен
+             getLogger().warning("Попытка отправить сообщение в Telegram, но токен/chat_id не настроены.");
+            return;
+        }
+
+        // Используем асинхронную задачу, чтобы не блокировать основной поток сервера
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                sendMessageToTelegramSync(message);
+            }
+        }.runTaskAsynchronously(this);
+    }
+
+    // Синхронный метод отправки (вызывается из async задачи или onDisable)
+    private void sendMessageToTelegramSync(String message) {
+         if (botToken == null || botToken.isEmpty() || chatId == null || chatId.isEmpty()) {
+             return; // Дополнительная проверка
+         }
+        HttpURLConnection connection = null;
+        try {
+            // URL Encode сообщение для безопасности
+            String encodedMessage = URLEncoder.encode(message, StandardCharsets.UTF_8.toString());
+            String urlString = "https://api.telegram.org/bot" + botToken + "/sendMessage";
+            String params = "chat_id=" + chatId + "&text=" + encodedMessage + "&parse_mode=HTML"; // Используем HTML для форматирования
+
+            URL url = new URL(urlString);
+            connection = (HttpURLConnection) url.openConnection();
+            connection.setRequestMethod("POST");
+            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded");
+            connection.setRequestProperty("Content-Length", Integer.toString(params.getBytes(StandardCharsets.UTF_8).length));
+            connection.setUseCaches(false);
+            connection.setDoOutput(true); // Разрешаем отправку данных
+
+            // Отправка параметров
+            try (OutputStream os = connection.getOutputStream()) {
+                byte[] input = params.getBytes(StandardCharsets.UTF_8);
+                os.write(input, 0, input.length);
+            }
+
+            // Чтение ответа (для отладки)
+            int responseCode = connection.getResponseCode();
+            if (responseCode != HttpURLConnection.HTTP_OK) {
+                // Читаем тело ошибки для диагностики
+                StringBuilder response = new StringBuilder();
+                 try (BufferedReader br = new BufferedReader(new InputStreamReader(connection.getErrorStream(), StandardCharsets.UTF_8))) {
+                     String responseLine;
+                     while ((responseLine = br.readLine()) != null) {
+                         response.append(responseLine.trim());
+                     }
+                     getLogger().warning("Ошибка отправки в Telegram! Код: " + responseCode + ", Ответ: " + response.toString());
+                 } catch (Exception e) {
+                    getLogger().warning("Ошибка отправки в Telegram! Код: " + responseCode + " (не удалось прочитать тело ошибки)");
+                 }
+            } else {
+                // Опционально: логировать успешную отправку
+                // getLogger().info("Сообщение успешно отправлено в Telegram.");
+            }
+
+        } catch (Exception e) {
+            getLogger().log(Level.SEVERE, "Не удалось отправить сообщение в Telegram:", e);
+        } finally {
+            if (connection != null) {
+                connection.disconnect();
+            }
+        }
+    }
+
+     // Вспомогательный метод для экранирования HTML
+     private String escapeHtml(String text) {
+         if (text == null) return "";
+         return text.replace("&", "&")
+                    .replace("<", "<")
+                    .replace(">", ">")
+                    .replace("\"", """)
+                    .replace("'", "'");
+     }
 }
