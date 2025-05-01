@@ -2,8 +2,11 @@ import psutil
 import platform
 import socket
 import datetime
+import time # Для часового пояса
 import os
 import sys
+import subprocess # Для запуска внешних команд (версии программ)
+import locale # Для получения системной локали/кодировки
 
 # --- Вспомогательные функции для форматирования ---
 
@@ -16,7 +19,7 @@ def get_size(bytes_val, suffix="B"):
         if bytes_val < factor:
             return f"{bytes_val:.2f}{unit}{suffix}"
         bytes_val /= factor
-    return f"{bytes_val:.2f}P{suffix}" # На случай очень больших значений
+    return f"{bytes_val:.2f}P{suffix}"
 
 def format_timedelta(td):
     """Форматирует объект timedelta в читаемый вид (дни, часы, минуты, секунды)"""
@@ -31,10 +34,52 @@ def format_timedelta(td):
         parts.append(f"{hours} ч")
     if minutes > 0:
         parts.append(f"{minutes} мин")
-    if seconds > 0 or not parts: # Показываем секунды, если нет других частей
+    if seconds > 0 or not parts:
          parts.append(f"{seconds} сек")
     return ", ".join(parts)
 
+def get_current_timezone():
+    """Пытается получить информацию о часовом поясе."""
+    try:
+        # Имена временных зон (могут быть неоднозначными)
+        tz_name = ", ".join(time.tzname)
+        # Смещение от UTC в секундах (учитывая DST, если активно)
+        offset_seconds = -time.timezone if not time.localtime().tm_isdst else -time.altzone
+        offset_hours = offset_seconds / 3600
+        # Формируем строку смещения UTC
+        offset_sign = '+' if offset_hours >= 0 else '-'
+        offset_str = f"UTC{offset_sign}{abs(offset_hours):.1f}"
+        return f"{tz_name} ({offset_str})"
+    except Exception as e:
+        return f"Не удалось определить ({e})"
+
+def run_command(command):
+    """Безопасно запускает команду и возвращает ее вывод или None."""
+    try:
+        # Определяем кодировку консоли для корректного декодирования
+        # Используем locale или фолбэк на UTF-8/cp1251(для Windows)
+        try:
+            stdout_encoding = locale.getpreferredencoding()
+        except Exception:
+            stdout_encoding = 'utf-8' if sys.platform != "win32" else 'cp1251' # Фоллбэк
+
+        # Запускаем процесс
+        result = subprocess.run(command, capture_output=True, text=True, shell=True, check=False, encoding=stdout_encoding, errors='ignore')
+
+        if result.returncode == 0 and result.stdout:
+             # Убираем лишние пробелы и переносы строк
+            return result.stdout.strip()
+        else:
+            # Выводим stderr если была ошибка для отладки (опционально)
+            # if result.stderr:
+            #     print(f"Ошибка при выполнении '{command}': {result.stderr.strip()}", file=sys.stderr)
+            return None
+    except FileNotFoundError:
+        # print(f"Команда '{command.split()[0]}' не найдена.", file=sys.stderr)
+        return None
+    except Exception as e:
+        # print(f"Исключение при выполнении '{command}': {e}", file=sys.stderr)
+        return None
 
 # --- Функции для сбора информации по разделам ---
 
@@ -45,83 +90,157 @@ def get_system_info():
     boot_time_timestamp = psutil.boot_time()
     bt = datetime.datetime.fromtimestamp(boot_time_timestamp)
     uptime = datetime.datetime.now() - bt
+    now = datetime.datetime.now()
 
     print(f"Система:            {uname.system}")
     print(f"Имя узла:           {uname.node}")
     print(f"Версия:             {uname.release}")
     print(f"Полная версия:      {uname.version}")
     print(f"Архитектура:        {uname.machine}")
-    print(f"Процессор:          {uname.processor}")
+    print(f"Процессор:          {uname.processor or 'N/A'}") # Добавим 'N/A' если пусто
     print(f"Версия Python:      {platform.python_version()}")
+    print(f"Текущее время:      {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Часовой пояс:       {get_current_timezone()}")
     print(f"Время загрузки:     {bt.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"Время работы:       {format_timedelta(uptime)}")
-    print("-" * 105) # Разделитель
+    try:
+        users = psutil.users()
+        print(f"Пользователи:       {', '.join([u.name for u in users]) if users else 'Нет активных сессий'}")
+    except Exception:
+         print("Пользователи:       Не удалось получить информацию")
+    try:
+        process_count = len(psutil.pids())
+        print(f"Всего процессов:    {process_count}")
+    except Exception:
+        print("Всего процессов:    Не удалось посчитать")
+
+    print("-" * 105)
 
 def get_cpu_info():
     """Собирает информацию о CPU."""
     print("="*40, "Информация о CPU", "="*40)
-    # Физические ядра
-    physical_cores = psutil.cpu_count(logical=False)
-    # Логические ядра (потоки)
-    logical_cores = psutil.cpu_count(logical=True)
-    print(f"Физические ядра:    {physical_cores}")
-    print(f"Логические ядра:    {logical_cores}")
+    cpu_info = {"total_usage": 0, "core_usages": []} # Для возврата данных анализатору
+    try:
+        physical_cores = psutil.cpu_count(logical=False)
+        logical_cores = psutil.cpu_count(logical=True)
+        print(f"Физические ядра:    {physical_cores if physical_cores else 'N/A'}")
+        print(f"Логические ядра:    {logical_cores if logical_cores else 'N/A'}")
+    except NotImplementedError:
+        print("Физические/логические ядра: Не удалось определить")
+        physical_cores = None
+        logical_cores = None
 
-    # Частота CPU
-    cpufreq = psutil.cpu_freq()
-    if cpufreq: # Не на всех системах доступно
-      print(f"Макс. частота:      {cpufreq.max:.2f} МГц")
-      print(f"Мин. частота:       {cpufreq.min:.2f} МГц")
-      print(f"Текущая частота:    {cpufreq.current:.2f} МГц")
-    else:
-      print("Частота CPU:        Не удалось определить")
+    try:
+        cpufreq = psutil.cpu_freq()
+        if cpufreq:
+            print(f"Макс. частота:      {cpufreq.max:.2f} МГц")
+            print(f"Мин. частота:       {cpufreq.min:.2f} МГц")
+            print(f"Текущая частота:    {cpufreq.current:.2f} МГц")
+        else:
+            print("Частота CPU:        Не поддерживается/Недоступно")
+    except Exception as e:
+        print(f"Частота CPU:        Не удалось получить ({e})")
+
 
     # Загрузка CPU
-    print("Загрузка CPU по ядрам:")
-    for i, percentage in enumerate(psutil.cpu_percent(percpu=True, interval=1)):
-        print(f"  Ядро {i}: {percentage}%")
-    total_cpu_usage = psutil.cpu_percent(interval=1) # Интервал важен для точности
-    print(f"Общая загрузка CPU: {total_cpu_usage}%")
+    try:
+        print("Загрузка CPU по ядрам:")
+        cpu_info["core_usages"] = psutil.cpu_percent(percpu=True, interval=0.5) # Небольшой интервал
+        for i, percentage in enumerate(cpu_info["core_usages"]):
+            print(f"  Ядро {i}: {percentage:>5.1f}%") # Выравнивание
+        cpu_info["total_usage"] = psutil.cpu_percent(interval=0.5)
+        print(f"Общая загрузка CPU: {cpu_info['total_usage']:>5.1f}%")
+    except Exception as e:
+         print(f"Загрузка CPU:       Не удалось получить ({e})")
+
+    # Время CPU (system, user, idle, etc.)
+    try:
+        cputimes = psutil.cpu_times_percent(interval=0.1) # Нужен интервал для percent
+        print("Время CPU (%):")
+        print(f"  Пользователь:     {cputimes.user:.1f}%")
+        print(f"  Система:          {cputimes.system:.1f}%")
+        print(f"  Простой:          {cputimes.idle:.1f}%")
+        if hasattr(cputimes, 'iowait') and cputimes.iowait is not None: # Доступно в основном на Linux
+            cpu_info["iowait"] = cputimes.iowait # Сохраняем для анализа
+            print(f"  Ожидание I/O:     {cputimes.iowait:.1f}%")
+        else:
+             cpu_info["iowait"] = None
+        # Можно добавить другие поля: interrupt, nice, softirq, steal, guest...
+        # print(f"  Прерывания:       {cputimes.interrupt:.1f}%")
+    except Exception as e:
+        print(f"Время CPU (%):      Не удалось получить ({e})")
+        cpu_info["iowait"] = None
+
     print("-" * 105)
-    return total_cpu_usage # Возвращаем общую загрузку для анализа
+    return cpu_info
 
 def get_memory_info():
-    """Собирает информацию об оперативной памяти (RAM)."""
-    print("="*40, "Информация о Памяти (RAM)", "="*40)
-    svmem = psutil.virtual_memory()
-    print(f"Всего:              {get_size(svmem.total)}")
-    print(f"Доступно:           {get_size(svmem.available)}")
-    print(f"Использовано:       {get_size(svmem.used)}")
-    print(f"Процент занятости:  {svmem.percent}%")
+    """Собирает информацию об оперативной памяти (RAM) и SWAP."""
+    print("="*40, "Информация о Памяти (RAM и SWAP)", "="*40)
+    mem_info = {"ram_percent": 0, "swap_percent": 0, "available_gb": 0}
+    try:
+        svmem = psutil.virtual_memory()
+        mem_info["ram_percent"] = svmem.percent
+        mem_info["available_gb"] = svmem.available / (1024**3) # Доступно в ГБ
+        print("--- Оперативная память (RAM) ---")
+        print(f"Всего:              {get_size(svmem.total)}")
+        print(f"Доступно:           {get_size(svmem.available)} ({mem_info['available_gb']:.2f} GB)")
+        print(f"Использовано:       {get_size(svmem.used)}")
+        print(f"Процент занятости:  {svmem.percent}%")
+        # Можно добавить детали: buffers, cached (особенно для Linux)
+        if hasattr(svmem, 'buffers') and svmem.buffers:
+            print(f"Буферы:             {get_size(svmem.buffers)}")
+        if hasattr(svmem, 'cached') and svmem.cached:
+            print(f"Кэшировано:         {get_size(svmem.cached)}")
 
-    # Информация о SWAP (если есть)
-    swap = psutil.swap_memory()
-    if swap.total > 0: # Показываем SWAP только если он используется
-        print("-" * 20, "SWAP", "-" * 20)
-        print(f"  Всего:            {get_size(swap.total)}")
-        print(f"  Свободно:         {get_size(swap.free)}")
-        print(f"  Использовано:     {get_size(swap.used)}")
-        print(f"  Процент занятости:{swap.percent}%")
+    except Exception as e:
+        print(f"RAM:                Не удалось получить информацию ({e})")
+
+
+    try:
+        swap = psutil.swap_memory()
+        print("--- Файл подкачки (SWAP) ---")
+        if swap.total > 0:
+            mem_info["swap_percent"] = swap.percent
+            print(f"  Всего:            {get_size(swap.total)}")
+            print(f"  Свободно:         {get_size(swap.free)}")
+            print(f"  Использовано:     {get_size(swap.used)}")
+            print(f"  Процент занятости:{swap.percent}%")
+            # Дополнительная информация о SWAP (часто полезна на Linux)
+            # print(f"  Swapped in:       {get_size(swap.sin)}") # С начала загрузки
+            # print(f"  Swapped out:      {get_size(swap.sout)}") # С начала загрузки
+        else:
+            print("  SWAP не используется или не настроен.")
+            mem_info["swap_percent"] = 0 # Явно указываем 0, если SWAP нет
+    except Exception as e:
+         print(f"SWAP:               Не удалось получить информацию ({e})")
+
     print("-" * 105)
-    return svmem.percent # Возвращаем процент использования RAM для анализа
+    return mem_info
 
 def get_disk_info():
-    """Собирает информацию о дисковых разделах."""
+    """Собирает информацию о дисковых разделах и общем I/O."""
     print("="*40, "Информация о Дисках", "="*40)
-    partitions = psutil.disk_partitions()
     disk_usage_list = []
-    for partition in partitions:
-        # Пропускаем некоторые типы файловых систем и устройства,
-        # которые могут вызвать ошибки доступа или не являются обычными дисками
-        # (особенно актуально для Linux с его /dev/loop, squashfs и т.д.)
-        if "cdrom" in partition.opts or partition.fstype == '' \
-           or (sys.platform.startswith("linux") and \
-               ("squashfs" in partition.fstype or "/snap/" in partition.mountpoint)):
-             continue
+    print("--- Разделы диска ---")
+    try:
+        partitions = psutil.disk_partitions()
+    except Exception as e:
+        print(f"Не удалось получить список разделов: {e}")
+        partitions = []
 
-        print(f"--- Устройство: {partition.device} ---")
+    for partition in partitions:
+        # Пропускаем некоторые типы файловых систем и устройства
+        if "cdrom" in partition.opts or partition.fstype == '' or \
+           (sys.platform.startswith("linux") and \
+            ("squashfs" in partition.fstype or "/snap/" in partition.mountpoint or "/boot" in partition.mountpoint or "tmpfs" in partition.fstype)) or \
+           (sys.platform == "win32" and partition.device.startswith("\\\\")): # Пропускаем сетевые диски на Windows
+            continue
+
+        print(f"\nУстройство: {partition.device}")
         print(f"  Точка монтирования: {partition.mountpoint}")
         print(f"  Файловая система:   {partition.fstype}")
+        print(f"  Опции монтирования: {partition.opts}")
         try:
             partition_usage = psutil.disk_usage(partition.mountpoint)
             total = get_size(partition_usage.total)
@@ -137,6 +256,8 @@ def get_disk_info():
             disk_usage_list.append({
                 "mountpoint": partition.mountpoint,
                 "percent": percent,
+                "total_raw": partition_usage.total,
+                "used_raw": partition_usage.used,
                 "total": total,
                 "used": used
             })
@@ -147,128 +268,181 @@ def get_disk_info():
              print(f"  Не удалось получить информацию о использовании (диск/раздел не найден?) для {partition.mountpoint}")
         except Exception as e:
             print(f"  Не удалось получить информацию о использовании для {partition.mountpoint}: {e}")
-    print("-" * 105)
-    return disk_usage_list # Возвращаем список использований дисков для анализа
 
-def get_network_info():
-    """Собирает информацию о сетевых интерфейсах."""
+    # Общее дисковое I/O
+    print("\n--- Общая статистика Disk I/O (с момента загрузки) ---")
+    try:
+        disk_io = psutil.disk_io_counters()
+        if disk_io:
+            print(f"Всего прочитано:    {get_size(disk_io.read_bytes)}")
+            print(f"Всего записано:     {get_size(disk_io.write_bytes)}")
+            print(f"Операций чтения:    {disk_io.read_count}")
+            print(f"Операций записи:   {disk_io.write_count}")
+            # Время чтения/записи (может быть не везде доступно)
+            if hasattr(disk_io, 'read_time') and hasattr(disk_io, 'write_time'):
+                 print(f"Время чтения (мс):  {disk_io.read_time}")
+                 print(f"Время записи (мс): {disk_io.write_time}")
+        else:
+            print("Статистика I/O недоступна.")
+    except Exception as e:
+        print(f"Не удалось получить статистику Disk I/O: {e}")
+
+    print("-" * 105)
+    return disk_usage_list
+
+def get_detailed_network_info():
+    """Собирает детальную информацию о сетевых интерфейсах."""
     print("="*40, "Сетевые Параметры", "="*40)
-    if_addrs = psutil.net_if_addrs()
+    network_info = {"interfaces": {}} # Для анализа
+    try:
+        if_addrs = psutil.net_if_addrs()
+    except Exception as e:
+        print(f"Не удалось получить список сетевых интерфейсов: {e}")
+        if_addrs = {}
+    try:
+        if_stats = psutil.net_if_stats()
+    except Exception as e:
+        print(f"Не удалось получить статистику сетевых интерфейсов: {e}")
+        if_stats = {}
+    try:
+        # Получаем счетчики для каждого интерфейса
+        net_io = psutil.net_io_counters(pernic=True)
+    except Exception as e:
+        print(f"Не удалось получить счетчики I/O сетевых интерфейсов: {e}")
+        net_io = {}
+
     for interface_name, interface_addresses in if_addrs.items():
         print(f"--- Интерфейс: {interface_name} ---")
+        network_info["interfaces"][interface_name] = {"addresses": [], "stats": None, "io": None}
+
+        # Статистика интерфейса (статус, скорость)
+        if interface_name in if_stats:
+            stats = if_stats[interface_name]
+            network_info["interfaces"][interface_name]["stats"] = stats # Сохраняем
+            print(f"  Статус:           {'Активен' if stats.isup else 'Неактивен'}")
+            print(f"  Скорость:         {stats.speed} Мбит/с" if stats.speed > 0 else "N/A")
+            # Дуплекс: 0=UNKNOWN, 1=HALF, 2=FULL
+            duplex_map = {0: "Неизвестно", 1: "Полудуплекс", 2: "Полный дуплекс"}
+            print(f"  Дуплекс:          {duplex_map.get(stats.duplex, 'N/A')}")
+            print(f"  MTU:              {stats.mtu}")
+        else:
+            print("  Статистика (статус, скорость): Недоступна")
+
+        # Адреса (IP, MAC)
+        mac_addr = None
         for address in interface_addresses:
-            if str(address.family) == 'AddressFamily.AF_INET': # IPv4
-                print(f"  IP Адрес (IPv4):  {address.address}")
-                print(f"  Маска подсети:    {address.netmask}")
-                print(f"  Широковещательный:{address.broadcast}")
-            elif str(address.family) == 'AddressFamily.AF_INET6': # IPv6
-                 print(f"  IP Адрес (IPv6):  {address.address}")
-            elif str(address.family) == 'AddressFamily.AF_PACKET' or str(address.family) == 'socket.AF_LINK': # MAC (Linux/macOS vs Windows)
-                # psutil < 5.4.0 used AF_LINK, >= 5.4.0 uses AF_PACKET on Linux/macOS
-                # На Windows MAC адрес может не отображаться через этот метод для всех интерфейсов
-                if address.address and len(address.address) == 17 and address.address.count(':') == 5: # Простая проверка формата MAC
-                     print(f"  MAC Адрес:        {address.address}")
-                     # print(f"  Маска подсети:    {address.netmask}") # Обычно None для MAC
-                     # print(f"  Широковещательный:{address.broadcast}") # Обычно None для MAC
+            addr_info = {"family": str(address.family), "address": address.address, "netmask": address.netmask, "broadcast": address.broadcast}
+            network_info["interfaces"][interface_name]["addresses"].append(addr_info) # Сохраняем
 
-    # Можно добавить статистику I/O, но она может быть объемной
-    # net_io = psutil.net_io_counters()
-    # print(f"\n--- Общая сетевая статистика ---")
-    # print(f"Всего байт отправлено: {get_size(net_io.bytes_sent)}")
-    # print(f"Всего байт получено:   {get_size(net_io.bytes_recv)}")
-    print("-" * 105)
+            if addr_info["family"] == 'AddressFamily.AF_INET': # IPv4
+                print(f"  IP Адрес (IPv4):  {addr_info['address']}")
+                if addr_info['netmask']:
+                    print(f"  Маска подсети:    {addr_info['netmask']}")
+                if addr_info['broadcast']: # Широковещательный адрес может быть не у всех интерфейсов (напр. VPN)
+                    print(f"  Широковещательный:{addr_info['broadcast']}")
+            elif addr_info["family"] == 'AddressFamily.AF_INET6': # IPv6
+                 print(f"  IP Адрес (IPv6):  {addr_info['address']}")
+            # Ищем MAC (может быть AF_PACKET на Linux/macOS или AF_LINK на старых psutil/BSD)
+            elif addr_info["family"] in ('AddressFamily.AF_PACKET', 'socket.AF_LINK'):
+                 # Проверяем, похож ли адрес на MAC
+                 if addr_info['address'] and len(addr_info['address']) == 17 and addr_info['address'].count(':') == 5:
+                     mac_addr = addr_info['address']
+                     print(f"  MAC Адрес:        {mac_addr}")
 
-# --- Функция анализа и выявления проблем ---
+        # Если MAC не был найден среди AF_PACKET/AF_LINK (актуально для Windows)
+        # Попробуем найти его в статистике, если возможно (менее надежно)
+        # if mac_addr is None and interface_name in if_stats:
+            # Попытка найти MAC другим способом (специфично для ОС, менее надежно)
+            # pass
 
-def analyze_system(cpu_usage, memory_usage, disk_usages):
-    """
-    Анализирует собранные метрики и выводит предупреждения о потенциальных проблемах.
-    Возвращает условный "процент поломки" (скорее, уровень нагрузки/риска).
-    """
-    print("="*40, "Анализ Системы и Проблемные Области", "="*40)
-    problems = []
-    stress_score = 0 # Условный балл нагрузки/риска (0-100)
-    factors_count = 0
+        # Сетевой I/O для этого интерфейса
+        if interface_name in net_io:
+            io = net_io[interface_name]
+            network_info["interfaces"][interface_name]["io"] = io # Сохраняем
+            print(f"  Отправлено:       {get_size(io.bytes_sent)}")
+            print(f"  Получено:         {get_size(io.bytes_recv)}")
+            print(f"  Пакетов отпр.:    {io.packets_sent}")
+            print(f"  Пакетов получ.:   {io.packets_recv}")
+            print(f"  Ошибок при получ.:{io.errin}")
+            print(f"  Ошибок при отпр.: {io.errout}")
+            print(f"  Отброшено при пол:{io.dropin}")
+            print(f"  Отброшено при отп:{io.dropout}")
+        else:
+             print("  Статистика I/O:   Недоступна")
 
-    # Пороги для предупреждений (можно настроить)
-    CPU_WARN_THRESHOLD = 85.0
-    MEM_WARN_THRESHOLD = 90.0
-    DISK_WARN_THRESHOLD = 90.0 # Процент использования диска
-
-    # Анализ CPU
-    if cpu_usage > CPU_WARN_THRESHOLD:
-        problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокая загрузка CPU: {cpu_usage:.1f}% (Порог: {CPU_WARN_THRESHOLD}%)")
-        stress_score += cpu_usage # Добавляем процент как вклад в общую оценку
+    # Wi-Fi информация (SSID, сигнал) - требует внешних инструментов/библиотек
+    print("\n--- Информация о Wi-Fi (если применимо) ---")
+    wifi_ssid = get_wifi_ssid()
+    if wifi_ssid:
+        print(f"Подключенная Wi-Fi сеть (SSID): {wifi_ssid}")
+        # Получение силы сигнала сложнее и платформозависимо, здесь не реализовано
     else:
-        stress_score += cpu_usage / 2 # Меньший вклад, если не критично
-    factors_count += 1
-
-    # Анализ Памяти
-    if memory_usage > MEM_WARN_THRESHOLD:
-         problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокое использование оперативной памяти: {memory_usage:.1f}% (Порог: {MEM_WARN_THRESHOLD}%)")
-         stress_score += memory_usage
-    else:
-        stress_score += memory_usage / 2
-    factors_count += 1
-
-    # Анализ Дисков
-    high_disk_usage_found = False
-    max_disk_percent = 0
-    for disk in disk_usages:
-        if disk["percent"] > DISK_WARN_THRESHOLD:
-             problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Мало места на диске '{disk['mountpoint']}': {disk['percent']:.1f}% использовано ({disk['used']}/{disk['total']}) (Порог: {DISK_WARN_THRESHOLD}%)")
-             high_disk_usage_found = True
-        # Находим максимальное использование диска для оценки нагрузки
-        if disk["percent"] > max_disk_percent:
-            max_disk_percent = disk["percent"]
-
-    # Добавляем максимальный процент использования диска к оценке
-    if high_disk_usage_found:
-        stress_score += max_disk_percent # Полный вклад, если есть проблема
-    else:
-         stress_score += max_disk_percent / 2 # Меньший вклад, если все ок
-    if disk_usages: # Учитываем диски, только если они были найдены
-         factors_count += 1
-
-
-    # Вывод результатов анализа
-    if problems:
-        print("Обнаружены потенциальные проблемы:")
-        for problem in problems:
-            print(f"  - {problem}")
-    else:
-        print("Потенциальных проблем с производительностью (CPU, RAM, Disk Space) не обнаружено.")
-
-    # Расчет и вывод "процента поломки" (уровня стресса)
-    # Это очень упрощенная и условная метрика!
-    if factors_count > 0:
-        overall_stress_percentage = stress_score / factors_count
-        print(f"\nУсловный уровень нагрузки системы: {overall_stress_percentage:.1f}%")
-        if overall_stress_percentage > 75:
-            print(">>> Система находится под высокой нагрузкой! <<<")
-        elif overall_stress_percentage > 50:
-            print(">>> Система находится под умеренной нагрузкой. <<<")
-    else:
-        print("\nНедостаточно данных для расчета уровня нагрузки.")
+        print("Информация о текущей Wi-Fi сети недоступна или не подключено.")
 
     print("-" * 105)
+    return network_info
 
-
-# --- Основной блок выполнения ---
-if __name__ == "__main__":
+def get_wifi_ssid():
+    """Пытается получить SSID текущей Wi-Fi сети (платформозависимо)."""
+    system = platform.system()
+    ssid = None
     try:
-        get_system_info()
-        cpu_load = get_cpu_info()
-        mem_load = get_memory_info()
-        disk_loads = get_disk_info()
-        get_network_info()
-        analyze_system(cpu_load, mem_load, disk_loads)
-
+        if system == "Windows":
+            # Используем netsh для получения SSID
+            result = run_command("netsh wlan show interfaces")
+            if result:
+                for line in result.split('\n'):
+                    if "SSID" in line and ":" in line:
+                        # Находим строку с SSID, убираем префикс и лишние пробелы
+                        ssid_part = line.split(":", 1)[1].strip()
+                        if ssid_part and "BSSID" not in line: # Убедимся что это не BSSID
+                             ssid = ssid_part
+                             break # Берем первый найденный SSID активного интерфейса
+        elif system == "Linux":
+            # Пробуем через nmcli (NetworkManager)
+            result = run_command("nmcli -t -f ACTIVE,SSID dev wifi")
+            if result:
+                for line in result.split('\n'):
+                    if line.startswith("yes:"):
+                        ssid = line.split(":", 1)[1].strip()
+                        break
+            # Если nmcli не сработал, пробуем iwgetid
+            if not ssid:
+                result = run_command("iwgetid -r")
+                if result:
+                    ssid = result.strip()
+        elif system == "Darwin": # macOS
+            result = run_command("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport -I")
+            if result:
+                for line in result.split('\n'):
+                    if " SSID:" in line:
+                        ssid = line.split(":", 1)[1].strip()
+                        break
     except Exception as e:
-        print(f"\n[ОШИБКА] Произошла непредвиденная ошибка при сборе информации: {e}")
-        import traceback
-        traceback.print_exc() # Вывод стека вызовов для отладки
+        # print(f"Ошибка при получении SSID: {e}", file=sys.stderr)
+        pass # Просто возвращаем None, если что-то пошло не так
+    return ssid
 
-    # Добавим паузу в конце для Windows, чтобы окно не закрывалось сразу
-    if sys.platform == "win32":
-        os.system("pause")
+
+def get_program_versions():
+    """Пытается определить версии некоторых встроенных программ."""
+    print("="*40, "Версии Программ", "="*40)
+    versions = {}
+    system = platform.system()
+
+    if system == "Windows":
+        # PowerShell
+        ps_version = run_command("powershell -Command \"$PSVersionTable.PSVersion.ToString()\"")
+        if ps_version:
+            print(f"PowerShell:         {ps_version}")
+            versions["powershell"] = ps_version
+        else:
+            # Пробуем pwsh для PowerShell Core
+             ps_core_version = run_command("pwsh -Command \"$PSVersionTable.PSVersion.ToString()\"")
+             if ps_core_version:
+                 print(f"PowerShell Core:    {ps_core_version}")
+                 versions["pwsh"] = ps_core_version
+             else:
+                  print("PowerShell:         Не найден или не удалось определить версию")
+
+    
