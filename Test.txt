@@ -1,316 +1,275 @@
+import socket
 import psutil
 import os
+import subprocess
 import platform
-import time # Для измерения времени подсчета файлов
-from colorama import init, Fore, Style, Back
+import re
+import requests
+import netifaces  # Для шлюза
+from colorama import Fore, Style, init
 
-# Инициализация colorama (autoreset=True сбрасывает цвет после каждого print)
+# Инициализация colorama (сбрасывает цвет после каждого print)
 init(autoreset=True)
 
-def bytes_to_human_readable(n_bytes):
-    """Конвертирует байты в удобочитаемый формат (KB, MB, GB, TB)."""
-    suffixes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB']
-    i = 0
-    while n_bytes >= 1024 and i < len(suffixes)-1:
-        n_bytes /= 1024.
-        i += 1
-    f = f'{n_bytes:.2f}'.rstrip('0').rstrip('.')
-    return f'{f} {suffixes[i]}'
-
-def get_disk_partitions():
-    """Возвращает список доступных дисковых разделов."""
-    partitions = []
+def get_network_interfaces():
+    """Получает информацию о сетевых интерфейсах (IP, MAC)."""
+    interfaces = {}
     try:
-        raw_partitions = psutil.disk_partitions(all=False)
-        if platform.system() == "Windows":
-            for p in raw_partitions:
-                 if 'removable' in p.opts and 'cdrom' not in p.opts:
+        addrs = psutil.net_if_addrs()
+        stats = psutil.net_if_stats() # Получаем статус интерфейсов
+
+        for name, snic_list in addrs.items():
+            interfaces[name] = {'ip_v4': None, 'ip_v6': None, 'mac': None, 'is_up': False, 'speed': 0}
+            if name in stats:
+                interfaces[name]['is_up'] = stats[name].isup
+                interfaces[name]['speed'] = stats[name].speed
+
+            for snic in snic_list:
+                if snic.family == socket.AF_INET:
+                    interfaces[name]['ip_v4'] = snic.address
+                elif snic.family == socket.AF_INET6:
+                    interfaces[name]['ip_v6'] = snic.address
+                # В psutil адрес MAC часто имеет семейство AF_LINK или специфичное для платформы
+                elif hasattr(psutil, 'AF_LINK') and snic.family == psutil.AF_LINK:
+                     interfaces[name]['mac'] = snic.address
+                # Для Windows MAC может не иметь AF_LINK, проверяем по длине
+                elif platform.system() == "Windows" and len(snic.address) == 17 and snic.address.count('-') == 5 :
+                     interfaces[name]['mac'] = snic.address.replace('-',':').lower() # Приводим к стандартному виду
+                # Иногда MAC может быть и в AF_PACKET на Linux
+                elif platform.system() == "Linux" and hasattr(socket, 'AF_PACKET') and snic.family == socket.AF_PACKET:
+                     interfaces[name]['mac'] = snic.address
+
+    except Exception as e:
+        print(f"{Fore.RED}Ошибка при получении информации об интерфейсах: {e}")
+    return interfaces
+
+def get_wifi_details():
+    """Пытается получить SSID и силу сигнала текущего Wi-Fi соединения."""
+    system = platform.system()
+    wifi_info = {'ssid': None, 'signal_strength': None}
+
+    try:
+        if system == "Windows":
+            # Используем netsh для получения информации о Wi-Fi
+            result = subprocess.check_output(['netsh', 'wlan', 'show', 'interfaces'], shell=True, text=True, encoding='cp866', errors='ignore')
+            ssid_match = re.search(r"SSID\s+:\s(.*)", result)
+            signal_match = re.search(r"Сигнал\s+:\s(\d+)%", result) # Ищем "Сигнал" для русской Windows
+            if not signal_match:
+                 signal_match = re.search(r"Signal\s+:\s(\d+)%", result) # Ищем "Signal" для английской
+
+            if ssid_match:
+                wifi_info['ssid'] = ssid_match.group(1).strip()
+            if signal_match:
+                wifi_info['signal_strength'] = f"{signal_match.group(1)}%"
+
+        elif system == "Linux":
+            try:
+                # Пытаемся использовать iwconfig
+                result = subprocess.check_output(['iwconfig'], shell=True, text=True, errors='ignore')
+                ssid_match = re.search(r'ESSID:"([^"]+)"', result)
+                signal_match = re.search(r'Signal level=([-\d]+)\s+dBm', result)
+                quality_match = re.search(r'Link Quality=(\d+)/(\d+)', result) # Качество связи как альтернатива
+
+                if ssid_match:
+                    wifi_info['ssid'] = ssid_match.group(1)
+                if signal_match:
+                     wifi_info['signal_strength'] = f"{signal_match.group(1)} dBm"
+                elif quality_match:
                      try:
-                         _ = psutil.disk_usage(p.mountpoint)
-                         partitions.append(p)
-                     except OSError as e:
-                          # print(f"{Fore.YELLOW}Пропуск {p.mountpoint}: {e}") # Для отладки
-                          continue
-                 else:
-                     partitions.append(p)
-        else:
-             partitions = raw_partitions
-    except Exception as e:
-        print(f"{Fore.RED}Ошибка при получении списка разделов: {e}")
-    return partitions
+                         quality = int(quality_match.group(1))
+                         total = int(quality_match.group(2))
+                         percent = int((quality / total) * 100)
+                         wifi_info['signal_strength'] = f"{percent}% ({quality}/{total})"
+                     except ValueError:
+                         pass # Не удалось преобразовать в числа
 
-def count_files_on_disk(mountpoint, size_limit_gb=3.0):
-    """
-    Подсчитывает количество файлов и папок на диске.
-    Выполняет подсчет только если ИСПОЛЬЗОВАННОЕ место < size_limit_gb ГБ
-    из-за потенциально долгого времени выполнения на больших дисках.
-    Возвращает (file_count, dir_count, elapsed_time) или None, если подсчет пропущен.
-    """
-    try:
-        usage = psutil.disk_usage(mountpoint)
-        used_gb = usage.used / (1024**3)
+            except FileNotFoundError:
+                 print(f"{Fore.YELLOW}Команда 'iwconfig' не найдена. Попробуйте установить wireless-tools.")
+            except subprocess.CalledProcessError:
+                 print(f"{Fore.YELLOW}Не удалось выполнить 'iwconfig'. Возможно, нет активного Wi-Fi интерфейса.")
 
-        if used_gb >= size_limit_gb:
-            print(f"{Fore.YELLOW}  Подсчет файлов пропущен: использовано {used_gb:.2f} ГБ (лимит {size_limit_gb} ГБ).")
-            print(f"{Fore.YELLOW}  Это сделано для экономии времени на больших или заполненных дисках.")
-            return None
-        
-        print(f"{Fore.CYAN}  Начинаю подсчет файлов и папок (использовано {used_gb:.2f} ГБ)... Это может занять некоторое время.")
-        
-        start_time = time.time()
-        file_count = 0
-        dir_count = 0
-        skipped_dirs = 0
-        
-        # Используем os.walk для обхода. errorhandler='ignore' пропускает ошибки доступа
-        # Если нужно видеть ошибки, можно убрать errorhandler или написать свой.
-        for root, dirs, files in os.walk(mountpoint, topdown=True, onerror=None):
-            # Обработка ошибок доступа вручную (альтернатива onerror)
-            accessible_dirs = []
-            for d in dirs:
-                try:
-                    # Пробуем получить доступ к следующей папке
-                    os.listdir(os.path.join(root, d)) 
-                    accessible_dirs.append(d)
-                except (PermissionError, FileNotFoundError):
-                    skipped_dirs += 1
-                    # print(f"Пропуск папки из-за ошибки доступа: {os.path.join(root, d)}") # Отладка
-            
-            # Говорим os.walk продолжать только с доступными папками
-            dirs[:] = accessible_dirs 
-            
-            file_count += len(files)
-            dir_count += len(dirs) # Считаем подпапки на текущем уровне
 
-        # Добавляем корневую папку (саму точку монтирования) к счетчику папок
-        dir_count += 1 
+        elif system == "Darwin": # macOS
+            try:
+                # Используем airport утилиту
+                airport_path = "/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport"
+                if os.path.exists(airport_path):
+                     result = subprocess.check_output([airport_path, '-I'], shell=False, text=True, errors='ignore')
+                     ssid_match = re.search(r"\s+SSID:\s(.*)", result)
+                     signal_match = re.search(r"\s+agrCtlRSSI:\s(.*)", result) # RSSI как показатель сигнала
 
-        end_time = time.time()
-        elapsed_time = end_time - start_time
-        
-        if skipped_dirs > 0:
-             print(f"{Fore.YELLOW}  Предупреждение: Пропущено {skipped_dirs} папок из-за ошибок доступа.")
-
-        return file_count, dir_count, elapsed_time
+                     if ssid_match:
+                         wifi_info['ssid'] = ssid_match.group(1).strip()
+                     if signal_match:
+                         wifi_info['signal_strength'] = f"{signal_match.group(1)} dBm (RSSI)"
+                else:
+                    print(f"{Fore.YELLOW}Утилита 'airport' не найдена по стандартному пути.")
+            except (FileNotFoundError, subprocess.CalledProcessError) as e:
+                 print(f"{Fore.YELLOW}Не удалось получить информацию Wi-Fi через airport: {e}")
 
     except Exception as e:
-        print(f"{Fore.RED}  Ошибка при подсчете файлов: {e}")
+        print(f"{Fore.RED}Ошибка при получении деталей Wi-Fi: {e}")
+
+    # Возвращаем только если есть хоть какая-то информация
+    if wifi_info['ssid'] or wifi_info['signal_strength']:
+        return wifi_info
+    else:
         return None
 
-
-def display_disk_info(partition):
-    """Выводит подробную информацию о выбранном разделе с цветом."""
-    mountpoint = partition.mountpoint
-    print(f"\n{Style.BRIGHT}{Fore.WHITE}{Back.BLUE}--- Подробная информация о диске {mountpoint} ---{Style.RESET_ALL}")
-
+def get_default_gateway():
+    """Получает шлюз по умолчанию."""
     try:
-        # 1. Информация об использовании диска
-        usage = psutil.disk_usage(mountpoint)
-        print(f"\n{Style.BRIGHT}{Fore.GREEN}[Использование диска]{Style.RESET_ALL}")
-        print(f"  {Fore.YELLOW}Всего места:{Style.RESET_ALL}    {bytes_to_human_readable(usage.total)} ({usage.total} байт)")
-        print(f"  {Fore.YELLOW}Использовано:{Style.RESET_ALL}   {bytes_to_human_readable(usage.used)} ({usage.used} байт)")
-        print(f"  {Fore.YELLOW}Свободно:{Style.RESET_ALL}       {bytes_to_human_readable(usage.free)} ({usage.free} байт)")
-        try:
-            percent_used = usage.percent
-            # Цвет в зависимости от загруженности
-            color = Fore.GREEN
-            if percent_used > 90:
-                color = Fore.RED
-            elif percent_used > 70:
-                color = Fore.YELLOW
-            print(f"  {Fore.YELLOW}Загруженность:{Style.RESET_ALL}  {color}{percent_used:.1f}%{Style.RESET_ALL}")
-        except Exception:
-            print(f"  {Fore.YELLOW}Загруженность:{Style.RESET_ALL}  {Fore.RED}Не удалось рассчитать процент.{Style.RESET_ALL}")
-
-        # 2. Информация о разделе
-        print(f"\n{Style.BRIGHT}{Fore.GREEN}[Техническая информация о разделе]{Style.RESET_ALL}")
-        print(f"  {Fore.YELLOW}Точка монтирования:{Style.RESET_ALL} {partition.mountpoint}")
-        print(f"  {Fore.YELLOW}Устройство:{Style.RESET_ALL}         {partition.device or Fore.LIGHTBLACK_EX + 'N/A'}")
-        print(f"  {Fore.YELLOW}Файловая система:{Style.RESET_ALL}   {partition.fstype or Fore.LIGHTBLACK_EX + 'N/A'}")
-        print(f"  {Fore.YELLOW}Опции монтирования:{Style.RESET_ALL} {partition.opts or Fore.LIGHTBLACK_EX + 'N/A'}")
-
-        # Дополнительная информация о файловой системе (Unix-like)
-        if hasattr(os, 'statvfs'): # Проверка доступности функции (Linux/macOS)
-             try:
-                 vfs_stat = os.statvfs(mountpoint)
-                 block_size = vfs_stat.f_bsize
-                 total_inodes = vfs_stat.f_files
-                 free_inodes = vfs_stat.f_ffree
-                 print(f"\n{Style.BRIGHT}{Fore.GREEN}[Дополнительно о ФС (statvfs)]{Style.RESET_ALL}")
-                 print(f"  {Fore.YELLOW}Размер блока:{Style.RESET_ALL}      {block_size} байт")
-                 if total_inodes > 0: # Не все ФС сообщают inodes
-                     used_inodes = total_inodes - free_inodes
-                     inodes_percent = (used_inodes / total_inodes) * 100 if total_inodes else 0
-                     print(f"  {Fore.YELLOW}Всего inode'ов:{Style.RESET_ALL}    {total_inodes}")
-                     print(f"  {Fore.YELLOW}Свободно inode'ов:{Style.RESET_ALL} {free_inodes} ({100 - inodes_percent:.1f}% свободно)")
-                 else:
-                     print(f"  {Fore.YELLOW}Информация об inode'ах:{Style.RESET_ALL} Недоступна для этой ФС")
-             except Exception as e:
-                 print(f"  {Fore.YELLOW}Не удалось получить доп. инфо (statvfs):{Style.RESET_ALL} {Fore.RED}{e}")
-
-
-        # 3. Информация о пользователе (Владелец точки монтирования)
-        print(f"\n{Style.BRIGHT}{Fore.GREEN}[Информация о владельце точки монтирования]{Style.RESET_ALL}")
-        try:
-             stat_info = os.stat(mountpoint)
-             owner_uid = stat_info.st_uid
-             owner_gid = stat_info.st_gid
-             owner_name = str(owner_uid)
-             group_name = str(owner_gid)
-
-             if platform.system() != "Windows":
-                try:
-                    import pwd
-                    owner_name = pwd.getpwuid(owner_uid).pw_name
-                except (ImportError, KeyError): pass
-                try:
-                    import grp
-                    group_name = grp.getgrgid(owner_gid).gr_name
-                except (ImportError, KeyError): pass
-             else: # Windows
-                 try:
-                     # Попытка использовать pywin32, если установлен
-                     import win32security
-                     sd = win32security.GetFileSecurity(mountpoint, win32security.OWNER_SECURITY_INFORMATION)
-                     owner_sid = sd.GetSecurityDescriptorOwner()
-                     name, domain, type = win32security.LookupAccountSid(None, owner_sid)
-                     owner_name = f"{domain}\\{name}"
-                     # Получение группы для корня диска менее стандартно
-                     group_name = Fore.LIGHTBLACK_EX + "N/A (Windows)"
-                 except ImportError:
-                    owner_name = f"{owner_uid} ({Fore.YELLOW}установите 'pywin32' для имени{Style.RESET_ALL})"
-                 except Exception as win_err:
-                    owner_name = f"{owner_uid} ({Fore.RED}ошибка win32: {win_err}{Style.RESET_ALL})"
-
-             print(f"  {Fore.YELLOW}Владелец:{Style.RESET_ALL} {owner_name} (UID: {owner_uid})")
-             print(f"  {Fore.YELLOW}Группа:{Style.RESET_ALL}   {group_name} (GID: {owner_gid})")
-
-        except Exception as e:
-            print(f"  {Fore.RED}Не удалось получить информацию о владельце: {e}")
-
-        # 4. Статистика ввода/вывода
-        print(f"\n{Style.BRIGHT}{Fore.GREEN}[Статистика ввода/вывода (с момента загрузки)]{Style.RESET_ALL}")
-        try:
-            io_counters = psutil.disk_io_counters(perdisk=True)
-            # Попытка сопоставить точку монтирования с ключом счетчика
-            matched_key = None
-            
-            # Простой подход: ищем ключ, который является началом пути устройства
-            # (например, /dev/sda1 -> sda) - часто работает на Linux
-            dev_basename = os.path.basename(partition.device) if partition.device else None
-            if dev_basename:
-                 # Удаляем цифры разделов (sda1 -> sda, nvme0n1p2 -> nvme0n1)
-                 import re
-                 match = re.match(r'^([a-zA-Z]+[0-9]+[a-zA-Z]*[0-9]*)', dev_basename) # nvme0n1, sdX
-                 simplified_dev = match.group(1) if match else dev_basename
-                 
-                 for key in io_counters.keys():
-                     if key == simplified_dev or key == dev_basename:
-                          matched_key = key
-                          break
-
-            # Если не нашли или на Windows (где имена другие), ищем по букве диска C: -> PhysicalDriveX?
-            # Это очень неточно, пропускаем пока сложную логику Windows
-            # if not matched_key and platform.system() == "Windows":
-                # print(f"  {Fore.YELLOW}Автоматическое сопоставление IO для Windows не реализовано.")
-
-            if matched_key and matched_key in io_counters:
-                counters = io_counters[matched_key]
-                print(f"  {Fore.CYAN}Статистика для '{matched_key}':{Style.RESET_ALL}")
-                print(f"    {Fore.YELLOW}Чтений:{Style.RESET_ALL}       {counters.read_count}")
-                print(f"    {Fore.YELLOW}Записей:{Style.RESET_ALL}      {counters.write_count}")
-                print(f"    {Fore.YELLOW}Байт прочитано:{Style.RESET_ALL} {bytes_to_human_readable(counters.read_bytes)}")
-                print(f"    {Fore.YELLOW}Байт записано:{Style.RESET_ALL}  {bytes_to_human_readable(counters.write_bytes)}")
-                read_time_ms = getattr(counters, 'read_time', None)
-                write_time_ms = getattr(counters, 'write_time', None)
-                if read_time_ms is not None:
-                     print(f"    {Fore.YELLOW}Время чтения (мс):{Style.RESET_ALL} {read_time_ms}")
-                if write_time_ms is not None:
-                     print(f"    {Fore.YELLOW}Время записи (мс):{Style.RESET_ALL} {write_time_ms}")
-            else:
-                 print(f"  {Fore.YELLOW}Подробная статистика ввода/вывода для этого раздела не найдена или не сопоставлена.")
-                 # print(f"  Доступные счетчики IO: {list(io_counters.keys())}") # Для отладки
-
-        except PermissionError:
-             print(f"  {Fore.RED}Недостаточно прав для доступа к статистике ввода/вывода.{Style.RESET_ALL}")
-             print(f"  {Fore.YELLOW}Попробуйте запустить скрипт от имени администратора (или с sudo).{Style.RESET_ALL}")
-        except Exception as e:
-             print(f"  {Fore.RED}Не удалось получить статистику ввода/вывода: {e}")
-
-        # 5. Подсчет файлов (если применимо)
-        print(f"\n{Style.BRIGHT}{Fore.GREEN}[Количество файлов и папок]{Style.RESET_ALL}")
-        file_count_result = count_files_on_disk(mountpoint, size_limit_gb=3.0) # Лимит 3 ГБ
-        if file_count_result:
-            f_count, d_count, e_time = file_count_result
-            print(f"  {Fore.YELLOW}Всего файлов:{Style.RESET_ALL}      {f_count:,}") # Форматирование с разделителями
-            print(f"  {Fore.YELLOW}Всего папок:{Style.RESET_ALL}       {d_count:,}")
-            print(f"  {Fore.YELLOW}Время подсчета:{Style.RESET_ALL}    {e_time:.2f} сек")
-
-
-    except FileNotFoundError:
-        print(f"{Fore.RED}Ошибка: Диск или точка монтирования '{mountpoint}' не найдена.")
-        print(f"{Fore.YELLOW}Возможно, диск был отключен.")
-    except PermissionError:
-        print(f"{Fore.RED}Ошибка: Недостаточно прав для доступа к информации о диске '{mountpoint}'.")
-        print(f"{Fore.YELLOW}Попробуйте запустить скрипт от имени администратора (или с sudo).")
+        gateways = netifaces.gateways()
+        default_gw = gateways.get('default', {}).get(netifaces.AF_INET)
+        if default_gw:
+            return default_gw[0] # Возвращаем IP шлюза
     except Exception as e:
-        print(f"{Back.RED}{Fore.WHITE}Произошла непредвиденная ошибка при получении информации о {mountpoint}: {e}{Style.RESET_ALL}")
+        print(f"{Fore.RED}Ошибка при получении шлюза: {e}")
+    return None
 
-    print(f"\n{Style.BRIGHT}{Fore.WHITE}{Back.BLUE}--- Конец информации о {mountpoint} ---{Style.RESET_ALL}")
-    input(f"\n{Fore.CYAN}Нажмите Enter для возврата к списку дисков...{Style.RESET_ALL}")
+def get_dns_servers():
+    """Пытается получить DNS-серверы."""
+    dns_servers = []
+    system = platform.system()
+    try:
+        if system == "Windows":
+            # Парсим вывод ipconfig /all
+            result = subprocess.check_output(['ipconfig', '/all'], shell=True, text=True, encoding='cp866', errors='ignore')
+            dns_matches = re.findall(r"DNS-серверы.*:\s+([\d\.\s]+(?:\n\s+[\d\.]+)*)", result)
+            if not dns_matches: # Для английской версии
+                dns_matches = re.findall(r"DNS Servers.*:\s+([\d\.\s]+(?:\n\s+[\d\.]+)*)", result)
 
+            for match in dns_matches:
+                 # Разделяем адреса, убираем пустые строки и пробелы
+                 servers = [ip.strip() for ip in re.split(r'\s+', match) if ip.strip()]
+                 dns_servers.extend(servers)
 
-if __name__ == "__main__":
-    while True: # Основной цикл для повторного показа списка
-        print("\n" + "="*50)
-        print(f"{Style.BRIGHT}{Fore.CYAN}Поиск подключенных дисков...{Style.RESET_ALL}")
-        available_partitions = get_disk_partitions()
-
-        if not available_partitions:
-            print(f"{Fore.RED}Не найдено доступных дисковых разделов.{Style.RESET_ALL}")
-            time.sleep(5) # Пауза перед повторной попыткой, если дисков нет
-            continue # Начать цикл заново
-
-        print(f"\n{Style.BRIGHT}{Fore.WHITE}Доступные диски:{Style.RESET_ALL}")
-        for i, p in enumerate(available_partitions):
+        elif system == "Linux":
+            # Читаем /etc/resolv.conf
             try:
-                usage = psutil.disk_usage(p.mountpoint)
-                size_info = f"({bytes_to_human_readable(usage.total)})"
-                # Добавим цвет для процента использования прямо в списке
-                percent_used = usage.percent
-                color = Fore.GREEN
-                if percent_used > 90: color = Fore.RED
-                elif percent_used > 70: color = Fore.YELLOW
-                percent_str = f"{color}{percent_used:.1f}%{Style.RESET_ALL} used"
-            except Exception:
-                size_info = f"({Fore.RED}ошибка доступа{Style.RESET_ALL})"
-                percent_str = ""
+                with open("/etc/resolv.conf", "r") as f:
+                    for line in f:
+                        if line.strip().startswith("nameserver"):
+                            parts = line.strip().split()
+                            if len(parts) > 1:
+                                dns_servers.append(parts[1])
+            except FileNotFoundError:
+                print(f"{Fore.YELLOW}/etc/resolv.conf не найден.")
 
-            print(f"  {Style.BRIGHT}{i + 1}.{Style.RESET_ALL} {Fore.MAGENTA}{p.mountpoint:<10}{Style.RESET_ALL} "
-                  f"{Fore.YELLOW}{size_info:<15}{Style.RESET_ALL} "
-                  f"[{Fore.CYAN}{p.fstype or 'N/A':<8}{Style.RESET_ALL}] "
-                  f"{percent_str}")
+        elif system == "Darwin": # macOS
+             # Используем scutil --dns
+             result = subprocess.check_output(['scutil', '--dns'], shell=False, text=True, errors='ignore')
+             resolver_matches = re.findall(r"nameserver\[\d+\]\s+:\s+([\d\.]+)", result)
+             dns_servers.extend(resolver_matches)
 
-        # Цикл запроса ввода пользователя
-        while True:
+    except Exception as e:
+        print(f"{Fore.RED}Ошибка при получении DNS-серверов: {e}")
+
+    # Убираем дубликаты, сохраняя порядок (если важно) или просто уникальные
+    return sorted(list(set(dns_servers)))
+
+
+def get_external_ip():
+    """Получает внешний IP-адрес."""
+    try:
+        response = requests.get('https://api.ipify.org?format=json', timeout=5)
+        response.raise_for_status() # Проверка на ошибки HTTP
+        return response.json().get('ip')
+    except requests.exceptions.RequestException as e:
+        print(f"{Fore.RED}Не удалось получить внешний IP: {e}")
+    except Exception as e:
+         print(f"{Fore.RED}Ошибка при получении внешнего IP: {e}")
+    return None
+
+def get_active_connections():
+    """Получает список активных сетевых соединений."""
+    connections = []
+    try:
+        conns = psutil.net_connections(kind='inet') # inet = TCP/UDP IPv4/IPv6
+        for conn in conns:
+            conn_info = {
+                'local_addr': f"{conn.laddr.ip}:{conn.laddr.port}" if conn.laddr else "N/A",
+                'remote_addr': f"{conn.raddr.ip}:{conn.raddr.port}" if conn.raddr else "N/A",
+                'status': conn.status,
+                'pid': conn.pid or 'N/A'
+            }
+            # Попробуем получить имя процесса по PID
             try:
-                prompt = f"\n{Fore.BLUE}Введите номер диска (1-{len(available_partitions)}), чтобы получить информацию, или {Fore.RED}0{Fore.BLUE} для выхода: {Style.RESET_ALL}"
-                choice = input(prompt)
-                choice_num = int(choice)
-
-                if choice_num == 0:
-                    print(f"{Fore.GREEN}Выход.{Style.RESET_ALL}")
-                    exit() # Выход из скрипта
-
-                if 1 <= choice_num <= len(available_partitions):
-                    selected_partition = available_partitions[choice_num - 1]
-                    display_disk_info(selected_partition)
-                    break # Выходим из цикла ввода, чтобы пересканировать диски
+                if conn.pid:
+                    proc = psutil.Process(conn.pid)
+                    conn_info['process_name'] = proc.name()
                 else:
-                    print(f"{Fore.RED}Неверный номер. Пожалуйста, введите число от 1 до {len(available_partitions)} или 0.")
+                    conn_info['process_name'] = 'System' if conn.pid == 0 else 'N/A'
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                 conn_info['process_name'] = 'N/A (Нет доступа)' if conn.pid else 'N/A'
 
-            except ValueError:
-                print(f"{Fore.RED}Неверный ввод. Пожалуйста, введите число.")
-            except KeyboardInterrupt:
-                print(f"\n{Fore.YELLOW}Выход по запросу пользователя (Ctrl+C).{Style.RESET_ALL}")
-                exit() # Выход из скрипта
+            connections.append(conn_info)
+    except Exception as e:
+        print(f"{Fore.RED}Ошибка при получении активных соединений: {e}")
+    return connections
+
+# --- Основное выполнение ---
+if __name__ == "__main__":
+    print(f"{Style.BRIGHT}{Fore.CYAN}--- Информация о сетевых интерфейсах ---{Style.RESET_ALL}")
+    interfaces = get_network_interfaces()
+    if interfaces:
+        for name, info in interfaces.items():
+            status = f"{Fore.GREEN}UP" if info['is_up'] else f"{Fore.RED}DOWN"
+            speed = f"{info['speed']} Mbps" if info['speed'] else "N/A"
+            print(f"{Fore.YELLOW}Интерфейс: {Style.BRIGHT}{name}{Style.RESET_ALL}")
+            print(f"  Статус: {status}")
+            print(f"  Скорость: {speed}")
+            print(f"  MAC адрес: {Fore.GREEN}{info.get('mac', 'N/A')}")
+            print(f"  IPv4 адрес: {Fore.GREEN}{info.get('ip_v4', 'N/A')}")
+            print(f"  IPv6 адрес: {Fore.GREEN}{info.get('ip_v6', 'N/A')}")
+            print("-" * 20)
+    else:
+        print(f"{Fore.YELLOW}Не удалось получить информацию об интерфейсах.")
+
+    print(f"\n{Style.BRIGHT}{Fore.CYAN}--- Детали Wi-Fi соединения ---{Style.RESET_ALL}")
+    wifi_details = get_wifi_details()
+    if wifi_details:
+        print(f"  Имя сети (SSID): {Fore.GREEN}{wifi_details.get('ssid', 'N/A')}")
+        print(f"  Сила сигнала: {Fore.GREEN}{wifi_details.get('signal_strength', 'N/A')}")
+        print(f"{Fore.MAGENTA}  Пароль: {Style.BRIGHT}Невозможно получить из соображений безопасности.{Style.RESET_ALL}")
+    else:
+        print(f"{Fore.YELLOW}Детали Wi-Fi не найдены или не применимы.")
+
+    print(f"\n{Style.BRIGHT}{Fore.CYAN}--- Основные сетевые параметры ---{Style.RESET_ALL}")
+    gateway = get_default_gateway()
+    print(f"  Шлюз по умолчанию: {Fore.GREEN}{gateway if gateway else 'N/A'}")
+
+    dns = get_dns_servers()
+    print(f"  DNS серверы: {Fore.GREEN}{', '.join(dns) if dns else 'N/A'}")
+
+    external_ip = get_external_ip()
+    print(f"  Внешний IP адрес: {Fore.GREEN}{external_ip if external_ip else 'N/A'}")
+
+    print(f"\n{Style.BRIGHT}{Fore.CYAN}--- Активные сетевые соединения (TCP/UDP) ---{Style.RESET_ALL}")
+    connections = get_active_connections()
+    if connections:
+        # Выводим только первые N соединений, чтобы не засорять вывод
+        max_connections_to_show = 20
+        print(f"{Fore.WHITE}{Style.BRIGHT}{'Локальный адрес':<25} {'Удаленный адрес':<25} {'Статус':<15} {'PID':<8} {'Процесс'}{Style.RESET_ALL}")
+        print("-" * 80)
+        count = 0
+        for conn in connections:
+             # Пропускаем LISTEN соединения без удаленного адреса для краткости, если их много
+             if conn['status'] == psutil.CONN_LISTEN and conn['remote_addr'] == 'N/A' and len(connections) > max_connections_to_show * 2 :
+                 continue
+
+             # Выводим информацию
+             local = conn['local_addr'] if conn['local_addr'] != 'N/A' else " " * 25
+             remote = conn['remote_addr'] if conn['remote_addr'] != 'N/A' else " " * 25
+             status = conn['status'] if conn['status'] != 'NONE' else 'UDP' # Отображаем UDP если статус NONE
+             pid = str(conn['pid'])
+             pname = conn.get('process_name', 'N/A')
+
+             print(f"{Fore.CYAN}{local:<25} {Fore.YELLOW}{remote:<25} {Fore.GREEN}{status:<15} {Fore.MAGENTA}{pid:<8} {Fore.WHITE}{pname}")
+
+             count += 1
+             if count >= max_connections_to_show and len(connections) > max_connections_to_show :
+                 print(f"{Fore.LIGHTBLACK_EX}... и еще {len(connections) - count} соединений ...{Style.RESET_ALL}")
+                 break # Прерываем вывод после достижения лимита
+    else:
+        print(f"{Fore.YELLOW}Не удалось получить информацию об активных соединениях.")
