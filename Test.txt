@@ -5,7 +5,7 @@ import subprocess
 import platform
 import re
 import requests
-import netifaces  # Для шлюза
+# netifaces больше не нужен
 from colorama import Fore, Style, init
 
 # Инициализация colorama (сбрасывает цвет после каждого print)
@@ -116,16 +116,54 @@ def get_wifi_details():
     else:
         return None
 
+# --- НОВАЯ ФУНКЦИЯ для получения шлюза без netifaces ---
 def get_default_gateway():
-    """Получает шлюз по умолчанию."""
+    """Получает шлюз по умолчанию, используя системные команды."""
+    system = platform.system()
+    gateway = None
     try:
-        gateways = netifaces.gateways()
-        default_gw = gateways.get('default', {}).get(netifaces.AF_INET)
-        if default_gw:
-            return default_gw[0] # Возвращаем IP шлюза
+        if system == "Windows":
+            # Используем 'route print' и ищем строку с 0.0.0.0
+            # -4 указывает искать только IPv4 маршруты
+            result = subprocess.check_output(['route', 'print', '-4'], shell=True, text=True, encoding='cp866', errors='ignore')
+            # Ищем строку вида: "0.0.0.0          0.0.0.0      <Шлюз>      <IP интерфейса>"
+            match = re.search(r'^\s*0\.0\.0\.0\s+0\.0\.0\.0\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+', result, re.MULTILINE)
+            if match:
+                gateway = match.group(1)
+
+        elif system == "Linux":
+            # Используем 'ip route show default'
+            result = subprocess.check_output(['ip', 'route', 'show', 'default'], shell=False, text=True, encoding='utf-8', errors='ignore')
+            # Ищем строку вида: "default via <Шлюз> dev <Интерфейс>"
+            match = re.search(r'default via (\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', result)
+            if match:
+                gateway = match.group(1)
+
+        elif system == "Darwin": # macOS
+            # Используем 'netstat -nr | grep default'
+            result = subprocess.check_output(['netstat', '-nr'], shell=False, text=True, encoding='utf-8', errors='ignore')
+            # Ищем строку, начинающуюся с 'default', второй столбец - шлюз
+            match = re.search(r'^default\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\s+', result, re.MULTILINE)
+            if match:
+                gateway = match.group(1)
+            # Альтернатива для macOS: 'route -n get default | grep gateway'
+            # try:
+            #     result_route = subprocess.check_output(['route', '-n', 'get', 'default'], shell=False, text=True, encoding='utf-8', errors='ignore')
+            #     match_route = re.search(r'gateway:\s*(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})', result_route)
+            #     if match_route:
+            #         gateway = match_route.group(1)
+            # except (FileNotFoundError, subprocess.CalledProcessError):
+            #     pass # Если route не сработал, полагаемся на netstat
+
+    except FileNotFoundError:
+        print(f"{Fore.YELLOW}Команда для определения шлюза не найдена в системе.")
+    except subprocess.CalledProcessError as e:
+        print(f"{Fore.YELLOW}Ошибка выполнения команды для определения шлюза: {e}")
     except Exception as e:
         print(f"{Fore.RED}Ошибка при получении шлюза: {e}")
-    return None
+
+    return gateway
+# --- Конец НОВОЙ ФУНКЦИИ ---
 
 def get_dns_servers():
     """Пытается получить DNS-серверы."""
@@ -141,7 +179,7 @@ def get_dns_servers():
 
             for match in dns_matches:
                  # Разделяем адреса, убираем пустые строки и пробелы
-                 servers = [ip.strip() for ip in re.split(r'\s+', match) if ip.strip()]
+                 servers = [ip.strip() for ip in re.split(r'\s+', match) if ip.strip() and ip.strip() != '::1'] # Исключаем локальный IPv6 адрес
                  dns_servers.extend(servers)
 
         elif system == "Linux":
@@ -162,11 +200,20 @@ def get_dns_servers():
              resolver_matches = re.findall(r"nameserver\[\d+\]\s+:\s+([\d\.]+)", result)
              dns_servers.extend(resolver_matches)
 
+    except FileNotFoundError:
+        print(f"{Fore.YELLOW}Команда для определения DNS не найдена.")
+    except subprocess.CalledProcessError as e:
+        print(f"{Fore.YELLOW}Ошибка выполнения команды для определения DNS: {e}")
     except Exception as e:
         print(f"{Fore.RED}Ошибка при получении DNS-серверов: {e}")
 
     # Убираем дубликаты, сохраняя порядок (если важно) или просто уникальные
-    return sorted(list(set(dns_servers)))
+    # Исключаем локальные адреса вроде 127.0.0.1 если они попали
+    unique_dns = []
+    for server in dns_servers:
+        if server not in unique_dns and server != '127.0.0.1':
+            unique_dns.append(server)
+    return unique_dns
 
 
 def get_external_ip():
@@ -195,13 +242,19 @@ def get_active_connections():
             }
             # Попробуем получить имя процесса по PID
             try:
-                if conn.pid:
+                if conn.pid is not None: # Проверяем, что PID не None
                     proc = psutil.Process(conn.pid)
                     conn_info['process_name'] = proc.name()
+                # Системные процессы (PID 0 в Windows, может быть иначе в Linux)
+                elif conn.pid == 0 and platform.system() == "Windows":
+                     conn_info['process_name'] = 'System'
                 else:
-                    conn_info['process_name'] = 'System' if conn.pid == 0 else 'N/A'
+                    conn_info['process_name'] = 'N/A'
             except (psutil.NoSuchProcess, psutil.AccessDenied):
-                 conn_info['process_name'] = 'N/A (Нет доступа)' if conn.pid else 'N/A'
+                 conn_info['process_name'] = 'N/A (Нет доступа)' if conn.pid is not None else 'N/A'
+            except psutil.ZombieProcess:
+                conn_info['process_name'] = 'Zombie Process'
+
 
             connections.append(conn_info)
     except Exception as e:
@@ -236,7 +289,7 @@ if __name__ == "__main__":
         print(f"{Fore.YELLOW}Детали Wi-Fi не найдены или не применимы.")
 
     print(f"\n{Style.BRIGHT}{Fore.CYAN}--- Основные сетевые параметры ---{Style.RESET_ALL}")
-    gateway = get_default_gateway()
+    gateway = get_default_gateway() # Используем новую функцию
     print(f"  Шлюз по умолчанию: {Fore.GREEN}{gateway if gateway else 'N/A'}")
 
     dns = get_dns_servers()
@@ -261,9 +314,13 @@ if __name__ == "__main__":
              # Выводим информацию
              local = conn['local_addr'] if conn['local_addr'] != 'N/A' else " " * 25
              remote = conn['remote_addr'] if conn['remote_addr'] != 'N/A' else " " * 25
-             status = conn['status'] if conn['status'] != 'NONE' else 'UDP' # Отображаем UDP если статус NONE
+             status = conn['status'] if conn['status'] not in ('NONE', None) else 'UDP' # Отображаем UDP если статус NONE или пустой
              pid = str(conn['pid'])
              pname = conn.get('process_name', 'N/A')
+
+             # Укорачиваем длинные имена процессов
+             if len(pname) > 25:
+                 pname = pname[:22] + "..."
 
              print(f"{Fore.CYAN}{local:<25} {Fore.YELLOW}{remote:<25} {Fore.GREEN}{status:<15} {Fore.MAGENTA}{pid:<8} {Fore.WHITE}{pname}")
 
