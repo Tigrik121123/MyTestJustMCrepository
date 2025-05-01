@@ -1,146 +1,262 @@
-package com.yourusername.telegramnotifier; // Замени на свой пакет
+import base64
+import codecs
+import binascii # Для отлова ошибок Base64
+import string
 
-import org.bukkit.Bukkit;
-import org.bukkit.ChatColor;
-import org.bukkit.configuration.file.FileConfiguration;
-import org.bukkit.plugin.java.JavaPlugin;
+# --- Функции дешифрования ---
 
-import java.io.BufferedReader;
-import java.io.InputStreamReader;
-import java.io.OutputStream;
-import java.net.HttpURLConnection;
-import java.net.URL;
-import java.net.URLEncoder;
-import java.nio.charset.StandardCharsets;
-import java.util.logging.Level;
+def decrypt_caesar(ciphertext):
+    """
+    Пытается расшифровать текст шифром Цезаря со всеми возможными сдвигами (1-25).
+    Возвращает список кортежей (сдвиг, расшифрованный_текст).
+    """
+    results = []
+    if not isinstance(ciphertext, str):
+        return results # Не строка, не можем обработать
 
-public final class TelegramNotifier extends JavaPlugin {
+    # Определяем алфавиты для перебора
+    # Можно расширить на другие языки при необходимости
+    alphabets = [
+        (string.ascii_lowercase, string.ascii_uppercase), # Английский
+        ('абвгдеёжзийклмнопрстуфхцчшщъыьэюя', 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ') # Русский
+    ]
 
-    private String botToken;
-    private String chatId;
-    private boolean configured = false;
+    for lower_alphabet, upper_alphabet in alphabets:
+        alphabet_len = len(lower_alphabet)
+        lang_name = "Английский" if lower_alphabet == string.ascii_lowercase else "Русский"
 
-    @Override
-    public void onEnable() {
-        // Сохраняем конфиг по умолчанию, если его нет
-        saveDefaultConfig();
-        // Загружаем конфиг
-        loadConfiguration();
+        for shift in range(1, alphabet_len):
+            decrypted_text = ""
+            for char in ciphertext:
+                if char in lower_alphabet:
+                    original_pos = lower_alphabet.find(char)
+                    new_pos = (original_pos - shift) % alphabet_len
+                    decrypted_text += lower_alphabet[new_pos]
+                elif char in upper_alphabet:
+                    original_pos = upper_alphabet.find(char)
+                    new_pos = (original_pos - shift) % alphabet_len
+                    decrypted_text += upper_alphabet[new_pos]
+                else:
+                    decrypted_text += char # Оставляем символы не из алфавита как есть
+            results.append((f"Цезарь ({lang_name}, сдвиг {shift})", decrypted_text))
+    return results
 
-        if (!configured) {
-            getLogger().warning("Плагин не настроен! Используйте /settoken и /setchatid.");
-        } else {
-             getLogger().info("TelegramNotifier включен и настроен.");
-             sendMessageAsync(getConfig().getString("messages.server-start", "✅ Сервер запущен!"));
-        }
+def decode_binary(ciphertext):
+    """
+    Пытается декодировать текст как двоичный код (разделенный пробелами).
+    Возвращает расшифрованный текст или None при ошибке.
+    """
+    if not isinstance(ciphertext, str):
+        return None
+    try:
+        # Убираем лишние пробелы по краям и разделяем
+        parts = ciphertext.strip().split()
+        # Проверяем, что все части - валидные двоичные числа
+        if not all(all(c in '01' for c in part) for part in parts if part):
+             return None
+        # Преобразуем каждую часть в символ
+        chars = [chr(int(part, 2)) for part in parts if part] # Игнорируем пустые части
+        return "".join(chars)
+    except (ValueError, TypeError):
+        # ValueError: если int(part, 2) не сработает (невалидный бинарный код)
+        # TypeError: если chr() получит некорректный номер символа
+        return None
+    except Exception: # Ловим другие возможные ошибки
+        return None
 
-        // Регистрация команд
-        this.getCommand("settoken").setExecutor(new SetCredentialsCommand(this));
-        this.getCommand("setchatid").setExecutor(new SetCredentialsCommand(this));
 
-        // Регистрация слушателя событий
-        getServer().getPluginManager().registerEvents(new EventListener(this), this);
+def decode_hex(ciphertext):
+    """
+    Пытается декодировать текст как шестнадцатеричный код.
+    Возвращает расшифрованный текст или None при ошибке.
+    """
+    if not isinstance(ciphertext, str):
+        return None
+    try:
+        # Удаляем пробелы и переводы строк, т.к. hex часто форматируют
+        cleaned_hex = "".join(ciphertext.split())
+        # Проверяем, что строка содержит только hex-символы и имеет четную длину
+        if not all(c in string.hexdigits for c in cleaned_hex) or len(cleaned_hex) % 2 != 0:
+            return None
+        byte_data = bytes.fromhex(cleaned_hex)
+        # Пытаемся декодировать как UTF-8, игнорируя ошибки
+        return byte_data.decode('utf-8', errors='ignore')
+    except (ValueError, TypeError):
+        # ValueError: bytes.fromhex если невалидный hex
+        return None
+    except Exception:
+        return None
 
-        getLogger().info("TelegramNotifier Plugin Enabled!");
-    }
+def decode_base64(ciphertext):
+    """
+    Пытается декодировать текст как Base64.
+    Возвращает расшифрованный текст или None при ошибке.
+    """
+    if not isinstance(ciphertext, str):
+        return None
+    try:
+        # Base64 требует padding, иногда его нет, пробуем добавить
+        missing_padding = len(ciphertext) % 4
+        if missing_padding:
+            ciphertext += '=' * (4 - missing_padding)
 
-    @Override
-    public void onDisable() {
-         if (configured) {
-             // Отправляем сообщение синхронно, т.к. сервер выключается
-             // ВНИМАНИЕ: Это может не всегда успеть отправиться при резкой остановке!
-             sendMessageSync(getConfig().getString("messages.server-stop", "❌ Сервер остановлен!"));
-         }
-        getLogger().info("TelegramNotifier Plugin Disabled!");
-    }
+        # Убедимся, что строка содержит только валидные Base64 символы
+        # (A-Z, a-z, 0-9, +, /, =)
+        # Это грубая проверка, binascii.Error точнее
+        valid_chars = string.ascii_letters + string.digits + '+/='
+        if not all(c in valid_chars or c.isspace() for c in ciphertext):
+             # Разрешаем пробелы, но b64decode их сам проигнорирует если надо
+             pass # Не выходим сразу, пусть b64decode попробует
 
-    // Метод для загрузки конфигурации
-    public void loadConfiguration() {
-        reloadConfig(); // Перезагружаем из файла
-        FileConfiguration config = getConfig();
-        this.botToken = config.getString("bot-token", "");
-        this.chatId = config.getString("chat-id", "");
+        byte_data = base64.b64decode(ciphertext, validate=True)
+         # Пытаемся декодировать как UTF-8, игнорируя ошибки
+        return byte_data.decode('utf-8', errors='ignore')
+    except (binascii.Error, ValueError, TypeError):
+        # binascii.Error: самая частая ошибка для невалидного Base64
+        return None
+    except Exception:
+        return None
 
-        if (this.botToken == null || this.botToken.isEmpty() || this.chatId == null || this.chatId.isEmpty()) {
-            this.configured = false;
-        } else {
-            this.configured = true;
-        }
-         getLogger().log(Level.INFO, "Конфигурация загружена. Бот настроен: " + configured);
-    }
+def reverse_text(ciphertext):
+    """
+    Просто переворачивает текст.
+    Возвращает перевернутый текст.
+    """
+    if not isinstance(ciphertext, str):
+        return None
+    try:
+        return ciphertext[::-1]
+    except Exception:
+        return None
 
-    // Геттер для проверки конфигурации
-    public boolean isConfigured() {
-        return configured;
-    }
+def decode_rot13(ciphertext):
+    """
+    Декодирует текст с помощью ROT13 (частный случай Цезаря со сдвигом 13).
+    Возвращает расшифрованный текст или None при ошибке.
+    """
+    if not isinstance(ciphertext, str):
+        return None
+    try:
+        return codecs.decode(ciphertext, 'rot_13')
+    except Exception: # На всякий случай
+        return None
 
-    // Метод для асинхронной отправки сообщения в Telegram
-    public void sendMessageAsync(String message) {
-        if (!configured) {
-            getLogger().warning("Попытка отправить сообщение, но плагин не настроен.");
-            return;
-        }
+def decrypt_atbash(ciphertext):
+    """
+    Расшифровывает текст шифром Атбаш (замена A->Z, B->Y и т.д.).
+    """
+    if not isinstance(ciphertext, str):
+        return None
 
-        // Используем планировщик Bukkit для асинхронной отправки
-        Bukkit.getScheduler().runTaskAsynchronously(this, () -> {
-            sendMessageSync(message); // Вызываем синхронный метод из асинхронной задачи
-        });
-    }
+    results = []
+    # Определяем алфавиты для обработки
+    alphabets = [
+        (string.ascii_lowercase, string.ascii_uppercase), # Английский
+        ('абвгдеёжзийклмнопрстуфхцчшщъыьэюя', 'АБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ') # Русский
+    ]
 
-    // Синхронный метод отправки (для вызова из onDisable и асинхронных задач)
-    private void sendMessageSync(String message) {
-        if (!configured) return; // Дополнительная проверка
+    for lower_alphabet, upper_alphabet in alphabets:
+        lang_name = "Английский" if lower_alphabet == string.ascii_lowercase else "Русский"
+        
+        lower_reversed = lower_alphabet[::-1]
+        upper_reversed = upper_alphabet[::-1]
+        
+        map_lower = str.maketrans(lower_alphabet, lower_reversed)
+        map_upper = str.maketrans(upper_alphabet, upper_reversed)
+        
+        decrypted_text = ""
+        possible_match = False # Флаг, что в тексте были символы этого алфавита
+        for char in ciphertext:
+            if char in lower_alphabet:
+                decrypted_text += char.translate(map_lower)
+                possible_match = True
+            elif char in upper_alphabet:
+                decrypted_text += char.translate(map_upper)
+                possible_match = True
+            else:
+                 decrypted_text += char
+        
+        # Добавляем результат, только если были найдены символы соответствующего алфавита
+        # Это предотвращает вывод одинакового текста для разных языков, если текст не содержит букв
+        if possible_match:
+             results.append((f"Атбаш ({lang_name})", decrypted_text))
+             
+    return results
 
-        HttpURLConnection connection = null;
-        try {
-            String encodedMessage = URLEncoder.encode(message, StandardCharsets.UTF_8.toString());
-            String urlString = "https://api.telegram.org/bot" + botToken + "/sendMessage?chat_id=" + chatId + "&text=" + encodedMessage + "&parse_mode=HTML"; // Можно использовать HTML или Markdown
 
-            URL url = new URL(urlString);
-            connection = (HttpURLConnection) url.openConnection();
-            connection.setRequestMethod("GET"); // GET-запрос для sendMessage обычно достаточен
-            connection.setConnectTimeout(5000); // 5 секунд таймаут соединения
-            connection.setReadTimeout(5000); // 5 секунд таймаут чтения
+# --- Основная часть ---
 
-            int responseCode = connection.getResponseCode();
+if __name__ == "__main__":
+    input_text = input("Введите текст для расшифровки: ")
 
-            if (responseCode != HttpURLConnection.HTTP_OK) {
-                // Читаем ответ об ошибке от Telegram API
-                BufferedReader in = new BufferedReader(new InputStreamReader(connection.getErrorStream()));
-                String inputLine;
-                StringBuilder errorResponse = new StringBuilder();
-                while ((inputLine = in.readLine()) != null) {
-                    errorResponse.append(inputLine);
-                }
-                in.close();
-                 getLogger().warning("Ошибка отправки сообщения в Telegram! Код: " + responseCode + ", Ответ: " + errorResponse.toString());
-            } else {
-                // Опционально: Логировать успешную отправку (может засорять консоль)
-                // getLogger().info("Сообщение успешно отправлено в Telegram.");
-            }
+    print(f"\n--- Попытки расшифровать: '{input_text}' ---")
 
-        } catch (Exception e) {
-            getLogger().severe("Исключение при отправке сообщения в Telegram: " + e.getMessage());
-            // e.printStackTrace(); // Раскомментировать для детальной отладки
-        } finally {
-            if (connection != null) {
-                connection.disconnect();
-            }
-        }
-    }
+    possible_decryptions = []
 
-    // Метод для форматирования сообщений (заменяет плейсхолдеры)
-    public String formatMessage(String key, String player, String content) {
-        String message = getConfig().getString("messages." + key, "");
-        if (player != null) {
-            message = message.replace("%player%", player);
-        }
-        if (content != null) {
-            // Экранируем базовые HTML теги для безопасности, если не используем parse_mode=HTML
-            // Если используем parse_mode=HTML, нужно быть осторожным с пользовательским вводом
-             content = content.replace("&", "&").replace("<", "<").replace(">", ">");
-             message = message.replace("%message%", content).replace("%command%", content);
-        }
-        return message;
-    }
-}
+    # 1. Переворот текста
+    reversed_res = reverse_text(input_text)
+    if reversed_res is not None:
+        possible_decryptions.append(("Переворот", reversed_res))
+
+    # 2. ROT13
+    rot13_res = decode_rot13(input_text)
+    if rot13_res is not None and rot13_res != input_text: # Не выводим, если ROT13 не изменил текст
+         possible_decryptions.append(("ROT13", rot13_res))
+
+    # 3. Атбаш (может вернуть несколько результатов)
+    atbash_results = decrypt_atbash(input_text)
+    possible_decryptions.extend(atbash_results)
+
+
+    # 4. Base64
+    base64_res = decode_base64(input_text)
+    if base64_res is not None:
+        possible_decryptions.append(("Base64", base64_res))
+
+    # 5. Hex (Шестнадцатеричный код)
+    hex_res = decode_hex(input_text)
+    if hex_res is not None:
+        possible_decryptions.append(("Hex (Шестнадцатеричный)", hex_res))
+
+    # 6. Binary (Двоичный код)
+    binary_res = decode_binary(input_text)
+    if binary_res is not None:
+        possible_decryptions.append(("Двоичный код (ASCII)", binary_res))
+
+    # 7. Шифр Цезаря (все сдвиги, 2 языка)
+    # Этот метод возвращает много вариантов, добавляем их все
+    caesar_results = decrypt_caesar(input_text)
+    possible_decryptions.extend(caesar_results)
+
+    # --- Вывод результатов ---
+    if not possible_decryptions:
+        print("\nНе удалось найти подходящих методов расшифровки.")
+    else:
+        print("\nВозможные варианты расшифровки:")
+        for method, result in possible_decryptions:
+            # Простая эвристика для фильтрации "мусора" после декодирования
+            # Считаем результат осмысленным, если он содержит хотя бы одну букву или цифру
+            # и не состоит преимущественно из непечатаемых или странных символов
+            # (Это очень базовая проверка!)
+            common_chars = string.ascii_letters + string.digits + string.punctuation + ' ' + 'абвгдеёжзийклмнопрстуфхцчшщъыьэюяАБВГДЕЁЖЗИЙКЛМНОПРСТУФХЦЧШЩЪЫЬЭЮЯ'
+            meaningful = False
+            if isinstance(result, str) and len(result) > 0:
+                 printable_count = sum(1 for char in result if char in common_chars or char.isprintable())
+                 # Считаем осмысленным, если хотя бы половина символов - "нормальные"
+                 # и есть хотя бы одна буква или цифра
+                 if printable_count / len(result) > 0.5 and any(c.isalnum() for c in result):
+                       meaningful = True
+
+            if meaningful:
+                 print(f"[{method}] - {result}")
+            # else:
+            #     # Можно раскомментировать для отладки, чтобы видеть отфильтрованные результаты
+            #     print(f"[{method}] - (Отфильтровано как возможный мусор) {result[:100]}{'...' if len(result)>100 else ''}")
+
+
+    # --- Важное замечание про хэши ---
+    print("\n--- Важное замечание ---")
+    print("Хеш-функции, такие как SHA-256, MD5 и другие, являются ОДНОСТОРОННИМИ.")
+    print("Это означает, что из полученного хеша НЕВОЗМОЖНО восстановить исходный текст.")
+    print("Их можно только проверить: захешировать предполагаемый исходный текст и сравнить хеши.")
+    print("Поэтому 'расшифровка' хешей не включена в этот скрипт.")
