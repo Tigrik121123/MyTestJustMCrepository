@@ -423,7 +423,6 @@ def get_wifi_ssid():
         pass # Просто возвращаем None, если что-то пошло не так
     return ssid
 
-
 def get_program_versions():
     """Пытается определить версии некоторых встроенных программ."""
     print("="*40, "Версии Программ", "="*40)
@@ -432,17 +431,569 @@ def get_program_versions():
 
     if system == "Windows":
         # PowerShell
-        ps_version = run_command("powershell -Command \"$PSVersionTable.PSVersion.ToString()\"")
+        # Сначала пробуем команду для встроенного PowerShell 5.1
+        ps_version = run_command("powershell -NoProfile -Command \"$PSVersionTable.PSVersion.ToString()\"")
         if ps_version:
-            print(f"PowerShell:         {ps_version}")
+            print(f"PowerShell (Windows): {ps_version}")
             versions["powershell"] = ps_version
         else:
-            # Пробуем pwsh для PowerShell Core
-             ps_core_version = run_command("pwsh -Command \"$PSVersionTable.PSVersion.ToString()\"")
-             if ps_core_version:
-                 print(f"PowerShell Core:    {ps_core_version}")
-                 versions["pwsh"] = ps_core_version
-             else:
-                  print("PowerShell:         Не найден или не удалось определить версию")
+             print("PowerShell (Windows): Не найден или не удалось определить версию")
 
-    
+        # Затем пробуем pwsh для PowerShell Core (7+)
+        ps_core_version = run_command("pwsh -NoProfile -Command \"$PSVersionTable.PSVersion.ToString()\"")
+        if ps_core_version:
+            print(f"PowerShell Core (pwsh): {ps_core_version}")
+            versions["pwsh"] = ps_core_version
+        else:
+            # Можно не выводить, если обычный PowerShell уже найден
+            if not ps_version:
+                print("PowerShell Core (pwsh): Не найден или не удалось определить версию")
+
+
+        # CMD - версии как таковой нет, привязана к ОС
+        print(f"CMD:                  Доступен (версия зависит от Windows {platform.release()})")
+
+        # .NET Framework (сложнее, смотрим через реестр или косвенно)
+        dotnet_check = run_command("reg query \"HKLM\\SOFTWARE\\Microsoft\\Net Framework Setup\\NDP\\v4\\Full\" /v Release")
+        if dotnet_check and "Release" in dotnet_check:
+             try:
+                 release_dword_str = dotnet_check.split()[-1]
+                 # Убедимся, что строка содержит шестнадцатеричное значение
+                 if release_dword_str.startswith("0x"):
+                     release_dword = int(release_dword_str, 16)
+                 else:
+                     # Если reg query вернула не hex (маловероятно, но возможно)
+                     raise ValueError("Не шестнадцатеричное значение")
+
+                 # Таблица соответствия Release DWORD и версий .NET
+                 if release_dword >= 533320: net_version = "4.8.1+" # Windows 11 22H2+
+                 elif release_dword >= 528040: net_version = "4.8"
+                 elif release_dword >= 461808: net_version = "4.7.2"
+                 elif release_dword >= 461308: net_version = "4.7.1"
+                 elif release_dword >= 460798: net_version = "4.7"
+                 elif release_dword >= 394802: net_version = "4.6.2"
+                 elif release_dword >= 394254: net_version = "4.6.1"
+                 elif release_dword >= 393295: net_version = "4.6"
+                 elif release_dword >= 379893: net_version = "4.5.2"
+                 elif release_dword >= 378675: net_version = "4.5.1"
+                 elif release_dword >= 378389: net_version = "4.5"
+                 else: net_version = "4.x (старая) или < 4.5"
+                 print(f".NET Framework 4.x:   {net_version} (Release {release_dword_str})")
+                 versions['dotnet_framework'] = net_version
+             except (ValueError, IndexError, Exception):
+                 print(".NET Framework 4.x:   Не удалось определить версию (ошибка парсинга)")
+        else:
+            print(".NET Framework 4.x:   Не найден (или версия < 4.5)")
+
+    elif system == "Linux":
+        # Bash
+        bash_version = run_command("bash --version")
+        if bash_version:
+            print(f"Bash:                 {bash_version.splitlines()[0]}")
+            versions["bash"] = bash_version.splitlines()[0]
+        else:
+            print("Bash:                 Не найден или не удалось определить версию")
+
+        # GCC (если установлен)
+        gcc_version = run_command("gcc --version")
+        if gcc_version:
+             print(f"GCC:                  {gcc_version.splitlines()[0]}")
+             versions["gcc"] = gcc_version.splitlines()[0]
+        else:
+             print("GCC:                  Не установлен или не найден в PATH")
+
+        # systemd (если используется)
+        systemd_version = run_command("systemctl --version")
+        if systemd_version:
+             print(f"systemd:              {systemd_version.splitlines()[0]}")
+             versions["systemd"] = systemd_version.splitlines()[0]
+        else:
+            # Проверим PID 1, чтобы понять, используется ли systemd вообще
+            try:
+                with open('/proc/1/comm', 'r') as f:
+                    pid1_comm = f.read().strip()
+                if pid1_comm != 'systemd':
+                    print(f"systemd:              Не используется (PID 1: {pid1_comm})")
+                else:
+                    print("systemd:              Не удалось определить версию (команда не сработала)")
+            except FileNotFoundError:
+                 print("systemd:              Не удалось определить статус")
+
+
+    elif system == "Darwin": # macOS
+        # Bash (может быть старая версия по умолчанию)
+        bash_version = run_command("bash --version")
+        if bash_version:
+            print(f"Bash:                 {bash_version.splitlines()[0]}")
+            versions["bash"] = bash_version.splitlines()[0]
+        else:
+            print("Bash:                 Не найден")
+
+        # Zsh (часто используется по умолчанию в новых macOS)
+        zsh_version = run_command("zsh --version")
+        if zsh_version:
+             print(f"Zsh:                  {zsh_version}")
+             versions["zsh"] = zsh_version
+        else:
+            print("Zsh:                  Не найден")
+
+        # Clang (Xcode command line tools)
+        clang_version = run_command("clang --version")
+        if clang_version:
+             print(f"Clang (Xcode):        {clang_version.splitlines()[0]}")
+             versions["clang"] = clang_version.splitlines()[0]
+        else:
+             print("Clang (Xcode):        Не установлен или не найден")
+
+    # Добавить другие программы по необходимости...
+    # Например: java -version, node -v, npm -v, git --version etc.
+    git_version = run_command("git --version")
+    if git_version:
+        print(f"Git:                  {git_version}")
+        versions["git"] = git_version
+
+    print("-" * 105)
+    return versions
+
+def get_sensor_info():
+    """Собирает информацию с сенсоров (температура, вентиляторы). Может быть не доступно."""
+    print("="*40, "Информация с Сенсоров", "="*40)
+    sensor_data = {"temperatures": {}, "fans": {}}
+
+    # Температуры
+    print("--- Температуры ---")
+    if hasattr(psutil, "sensors_temperatures"):
+        try:
+            temps = psutil.sensors_temperatures()
+            if not temps:
+                print("Датчики температуры не найдены или не поддерживаются.")
+            else:
+                has_temp_data = False
+                for name, entries in temps.items():
+                    valid_entries = [e for e in entries if isinstance(e.current, (int, float))] # Фильтруем пустые или некорректные
+                    if not valid_entries: continue # Пропускаем датчик без данных
+
+                    print(f"Датчик '{name}':")
+                    sensor_data["temperatures"][name] = []
+                    has_temp_data = True
+                    for entry in valid_entries:
+                        label = f" ({entry.label})" if entry.label else ""
+                        current_temp = entry.current
+                        high = f", high={entry.high}°C" if entry.high and isinstance(entry.high, (int, float)) else ""
+                        critical = f", critical={entry.critical}°C" if entry.critical and isinstance(entry.critical, (int, float)) else ""
+                        print(f"  - Текущая{label}: {current_temp}°C{high}{critical}")
+                        sensor_data["temperatures"][name].append({
+                            "label": entry.label,
+                            "current": current_temp,
+                            "high": entry.high,
+                            "critical": entry.critical
+                        })
+                if not has_temp_data:
+                     print("Доступные датчики не предоставили данных о температуре.")
+
+        except Exception as e:
+            print(f"Не удалось получить данные с датчиков температуры: {e}")
+    else:
+        print("Функция sensors_temperatures() не доступна в этой версии psutil/ОС.")
+
+    # Вентиляторы
+    print("\n--- Вентиляторы ---")
+    if hasattr(psutil, "sensors_fans"):
+        try:
+            fans = psutil.sensors_fans()
+            if not fans:
+                print("Датчики вентиляторов не найдены или не поддерживаются.")
+            else:
+                 sensor_data["fans"] = {} # Перезаписываем, если данные есть
+                 has_fan_data = False
+                 for name, entries in fans.items():
+                    valid_entries = [e for e in entries if isinstance(e.current, (int, float))]
+                    if not valid_entries: continue
+
+                    print(f"Датчик '{name}':")
+                    sensor_data["fans"][name] = []
+                    has_fan_data = True
+                    for entry in valid_entries:
+                        label = f" ({entry.label})" if entry.label else ""
+                        print(f"  - Текущая скорость{label}: {entry.current} RPM")
+                        sensor_data["fans"][name].append({"label": entry.label, "current": entry.current})
+                 if not has_fan_data:
+                     print("Доступные датчики не предоставили данных о скорости вентиляторов.")
+
+        except Exception as e:
+            print(f"Не удалось получить данные с датчиков вентиляторов: {e}")
+    else:
+         print("Функция sensors_fans() не доступна в этой версии psutil/ОС.")
+
+    print("-" * 105)
+    return sensor_data
+
+def get_battery_info():
+    """Собирает информацию о батарее (если есть)."""
+    print("="*40, "Информация о Батарее", "="*40)
+    battery_data = None
+    if hasattr(psutil, "sensors_battery"):
+        try:
+            battery = psutil.sensors_battery()
+            if battery:
+                # Проверяем, что значение процента корректно
+                charge_percent = battery.percent if isinstance(battery.percent, (int, float)) else None
+
+                battery_data = {
+                    "percent": charge_percent,
+                    "secsleft": battery.secsleft,
+                    "power_plugged": battery.power_plugged # Может быть None, True, False
+                }
+
+                if charge_percent is not None:
+                    print(f"Заряд:              {charge_percent:.1f}%")
+                else:
+                    print("Заряд:              Не удалось определить")
+
+                if battery.power_plugged is True:
+                    status = "Заряжается" if charge_percent is not None and charge_percent < 100 else "Полностью заряжена (или неизвестно)"
+                    print(f"Статус:             Подключено к сети ({status})")
+                elif battery.power_plugged is False:
+                    print("Статус:             Работа от батареи")
+                    # POWER_TIME_UNLIMITED = -1, POWER_TIME_UNKNOWN = -2
+                    if battery.secsleft and battery.secsleft > 0:
+                         time_left_str = format_timedelta(datetime.timedelta(seconds=battery.secsleft))
+                         print(f"Оставшееся время:  ~{time_left_str}")
+                    elif battery.secsleft == psutil.POWER_TIME_UNKNOWN:
+                         print("Оставшееся время:  Неизвестно (расчет)")
+                    else: # Либо 0, либо unlimited (-1)
+                         print("Оставшееся время:  Не применимо или разряжена")
+                else: # battery.power_plugged is None
+                    print("Статус:             Неизвестно (подключено ли питание)")
+
+            else:
+                print("Батарея не найдена или не поддерживается.")
+        except Exception as e:
+            print(f"Не удалось получить информацию о батарее: {e}")
+            battery_data = None # Сбрасываем в случае ошибки
+    else:
+        print("Функция sensors_battery() не доступна в этой версии psutil/ОС.")
+
+    print("-" * 105)
+    return battery_data
+
+
+# --- Функция анализа и выявления проблем ---
+
+def analyze_system(cpu_info, mem_info, disk_usages, sensor_data, battery_data):
+    """
+    Анализирует собранные метрики и выводит предупреждения о потенциальных проблемах.
+    Возвращает условный "уровень стресса" системы.
+
+    Предполагается, что входные словари имеют следующую структуру (или None/пустой):
+    cpu_info: {'total_usage': float, 'core_usages': list[float], 'iowait': float | None}
+    mem_info: {'ram_percent': float, 'swap_percent': float, 'available_gb': float}
+    disk_usages: list[{'mountpoint': str, 'percent': float, 'total': str, 'used': str}]
+    sensor_data: {'temperatures': {'sensor_name': [{'label': str|None, 'current': float, 'high': float|None, 'critical': float|None}]},
+                  'fans': {'sensor_name': [{'label': str|None, 'current': float}]}}
+    battery_data: {'percent': float|None, 'secsleft': int|None, 'power_plugged': bool|None}
+    """
+    print("="*40, "Анализ Системы и Проблемные Области", "="*40)
+    problems = []
+    stress_score = 0.0 # Используем float для точности
+    factors_count = 0.0
+
+    # Пороги для предупреждений (можно настроить)
+    CPU_WARN_THRESHOLD = 85.0
+    CPU_HIGH_THRESHOLD = 70.0
+    MEM_WARN_THRESHOLD = 90.0
+    MEM_HIGH_THRESHOLD = 75.0
+    SWAP_WARN_THRESHOLD = 75.0
+    DISK_WARN_THRESHOLD = 90.0
+    DISK_HIGH_THRESHOLD = 80.0
+    TEMP_WARN_THRESHOLD = 90.0 # °C
+    TEMP_HIGH_THRESHOLD = 80.0 # °C
+    IOWAIT_WARN_THRESHOLD = 20.0 # %
+    LOW_AVAILABLE_MEM_GB = 1.0 # GB
+    LOW_BATTERY_PERCENT = 20.0 # %
+    LOW_BATTERY_TIME_MIN = 15 # минуты
+
+    # --- Анализ CPU ---
+    if cpu_info and isinstance(cpu_info.get("total_usage"), (int, float)):
+        cpu_usage = cpu_info["total_usage"]
+        if cpu_usage > CPU_WARN_THRESHOLD:
+            problems.append(f"[КРИТИЧНО] Очень высокая загрузка CPU: {cpu_usage:.1f}% (Порог: >{CPU_WARN_THRESHOLD}%)")
+            stress_score += cpu_usage * 1.2
+        elif cpu_usage > CPU_HIGH_THRESHOLD:
+            problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокая загрузка CPU: {cpu_usage:.1f}% (Порог: >{CPU_HIGH_THRESHOLD}%)")
+            stress_score += cpu_usage
+        else:
+             stress_score += cpu_usage / 2
+        factors_count += 1.0
+
+        # Анализ I/O Wait
+        iowait = cpu_info.get("iowait")
+        if isinstance(iowait, (int, float)) and iowait > 0: # Проверяем что значение есть и > 0
+             if iowait > IOWAIT_WARN_THRESHOLD:
+                 problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокое время ожидания Disk I/O: {iowait:.1f}% (Порог: >{IOWAIT_WARN_THRESHOLD}%). Возможен медленный диск или высокая дисковая активность.")
+                 # I/O wait сильно влияет на отзывчивость, даем больший вес
+                 stress_score += iowait * 1.5
+                 factors_count += 0.5 # Добавляем как доп. фактор, но с меньшим весом чем CPU/RAM
+             # else: # Небольшое iowait обычно нормально, не добавляем в скор
+             #     pass
+
+    # --- Анализ Памяти (RAM) ---
+    if mem_info and isinstance(mem_info.get("ram_percent"), (int, float)) and isinstance(mem_info.get("available_gb"), (int, float)):
+        ram_percent = mem_info["ram_percent"]
+        available_gb = mem_info["available_gb"]
+        if ram_percent > MEM_WARN_THRESHOLD:
+            problems.append(f"[КРИТИЧНО] Очень высокое использование RAM: {ram_percent:.1f}% (Порог: >{MEM_WARN_THRESHOLD}%)")
+            stress_score += ram_percent * 1.2
+        elif ram_percent > MEM_HIGH_THRESHOLD:
+            problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокое использование RAM: {ram_percent:.1f}% (Порог: >{MEM_HIGH_THRESHOLD}%)")
+            stress_score += ram_percent
+        else:
+            stress_score += ram_percent / 2
+        factors_count += 1.0
+
+        # Дополнительная проверка на абсолютное количество доступной памяти
+        if available_gb < LOW_AVAILABLE_MEM_GB and ram_percent > (MEM_HIGH_THRESHOLD * 0.8): # Порог срабатывания зависит от % использования
+             problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Очень мало доступной RAM: {available_gb:.2f} GB (Порог: <{LOW_AVAILABLE_MEM_GB} GB). Возможны проблемы с производительностью.")
+             # Добавим штраф к скору, пропорциональный нехватке памяти
+             stress_score += (MEM_HIGH_THRESHOLD * (1 - available_gb / LOW_AVAILABLE_MEM_GB)) * 0.5
+             # Не увеличиваем factors_count, т.к. это модификатор проблемы RAM
+
+    # --- Анализ SWAP ---
+    if mem_info and isinstance(mem_info.get("swap_percent"), (int, float)) and mem_info["swap_percent"] > 0:
+        swap_percent = mem_info["swap_percent"]
+        if swap_percent > SWAP_WARN_THRESHOLD:
+             problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокое использование SWAP: {swap_percent:.1f}% (Порог: >{SWAP_WARN_THRESHOLD}%). Вероятна нехватка RAM, система может тормозить.")
+             stress_score += swap_percent * 1.1 # SWAP медленный, штраф выше
+             factors_count += 0.5 # SWAP - важный доп. фактор
+
+        # --- Анализ Дисков ---
+        max_disk_percent = 0.0
+        high_disk_usage_found = False
+        critical_disk_usage_found = False
+        # Добавляем проверку, что disk_usages это список (может быть None или другим типом при ошибке)
+        if isinstance(disk_usages, list) and disk_usages: # Проверяем, что список не пустой
+            disk_factor_counted = False # Считаем фактор диска только один раз
+            for disk in disk_usages:
+                # Проверяем наличие и тип ключа 'percent'
+                if isinstance(disk, dict) and isinstance(disk.get("percent"), (int, float)):
+                    disk_percent = disk["percent"]
+                    mountpoint = disk.get('mountpoint', 'N/A')
+                    used_str = disk.get('used', 'N/A')
+                    total_str = disk.get('total', 'N/A')
+
+                    if disk_percent > DISK_WARN_THRESHOLD:
+                        problems.append(f"[КРИТИЧНО] Критически мало места на диске '{mountpoint}': {disk_percent:.1f}% использовано ({used_str}/{total_str}) (Порог: >{DISK_WARN_THRESHOLD}%)")
+                        critical_disk_usage_found = True
+                    elif disk_percent > DISK_HIGH_THRESHOLD:
+                        problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Мало места на диске '{mountpoint}': {disk_percent:.1f}% использовано ({used_str}/{total_str}) (Порог: >{DISK_HIGH_THRESHOLD}%)")
+                        high_disk_usage_found = True
+
+                    # Находим максимальное использование для оценки
+                    if disk_percent > max_disk_percent:
+                        max_disk_percent = disk_percent
+
+                    # Отмечаем, что фактор диска нужно учесть, если нашли хоть один валидный диск
+                    if not disk_factor_counted:
+                        factors_count += 1.0 # Учитываем диски как один фактор
+                        disk_factor_counted = True # Считаем только раз
+
+            # Добавляем максимальный процент использования диска к оценке, если фактор был учтен
+            if disk_factor_counted:
+                if critical_disk_usage_found:
+                    stress_score += max_disk_percent * 1.1
+                elif high_disk_usage_found:
+                     stress_score += max_disk_percent
+                else:
+                     stress_score += max_disk_percent / 2
+            # else: # Если список дисков был, но не нашлось валидных данных
+            #    pass # Ничего не добавляем и фактор не считаем
+
+        # --- Анализ Температуры ---
+        max_temp = 0.0
+        high_temp_found = False
+        critical_temp_found = False
+        temp_data_available = False
+        # Добавляем проверки типов данных на каждом уровне
+        if isinstance(sensor_data, dict) and isinstance(sensor_data.get("temperatures"), dict) and sensor_data["temperatures"]:
+            temp_factor_counted = False # Считаем фактор температуры один раз
+            for sensor_name, entries in sensor_data["temperatures"].items():
+                if not isinstance(entries, list): continue # Пропускаем некорректные данные
+                for entry in entries:
+                    if not isinstance(entry, dict): continue
+                    temp = entry.get("current")
+                    if not isinstance(temp, (int, float)): continue # Пропускаем, если нет текущей температуры
+
+                    temp_data_available = True # Помечаем, что нашли хоть какие-то данные
+                    if not temp_factor_counted:
+                         temp_weight = 0.75 # Вес фактора температуры
+                         factors_count += temp_weight # Добавляем фактор с весом
+                         temp_factor_counted = True
+
+                    label_str = f" ({entry['label']})" if entry.get('label') else ""
+                    sensor_id = f"'{sensor_name}'{label_str}"
+
+                    # Ищем максимальную температуру для общей оценки
+                    if temp > max_temp:
+                        max_temp = temp
+
+                    # Проверяем пороги high/critical из psutil, если они есть и корректны
+                    critical_threshold = entry.get("critical")
+                    is_critical = False
+                    if isinstance(critical_threshold, (int, float)) and temp >= critical_threshold:
+                         problems.append(f"[КРИТИЧНО] Критическая температура {sensor_id}: {temp}°C (Порог датчика: {critical_threshold}°C)")
+                         critical_temp_found = True
+                         is_critical = True # Помечаем, чтобы не проверять другие пороги для этого entry
+
+                    high_threshold = entry.get("high")
+                    is_high = False
+                    if not is_critical and isinstance(high_threshold, (int, float)) and temp >= high_threshold:
+                         problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокая температура {sensor_id}: {temp}°C (Порог датчика: {high_threshold}°C)")
+                         high_temp_found = True
+                         is_high = True # Помечаем
+
+                    # Если пороги из psutil не сработали, проверяем общие пороги
+                    if not is_critical and not is_high:
+                        if temp > TEMP_WARN_THRESHOLD:
+                             problems.append(f"[КРИТИЧНО] Очень высокая температура {sensor_id}: {temp}°C (Общий порог: >{TEMP_WARN_THRESHOLD}°C)")
+                             critical_temp_found = True # Отмечаем общую критичность
+                        elif temp > TEMP_HIGH_THRESHOLD:
+                             problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Высокая температура {sensor_id}: {temp}°C (Общий порог: >{TEMP_HIGH_THRESHOLD}°C)")
+                             high_temp_found = True # Отмечаем общую высокую температуру
+
+            # Добавляем максимальную температуру к оценке, если фактор был учтен
+            if temp_factor_counted:
+                temp_weight = 0.75 # Используем тот же вес, что и при добавлении фактора
+                if critical_temp_found:
+                     stress_score += max_temp * 1.1 * temp_weight # Штраф за перегрев
+                elif high_temp_found:
+                     stress_score += max_temp * temp_weight
+                else:
+                     stress_score += max_temp / 3 * temp_weight # Меньший вес, если в норме
+            # else: # Если данные сенсоров были, но валидных температур не нашлось
+            #    pass
+
+        # --- Анализ Батареи ---
+        # Проверяем, что battery_data это словарь
+        if isinstance(battery_data, dict):
+            charge = battery_data.get("percent")
+            plugged = battery_data.get("power_plugged") # Может быть None, True, False
+            secs_left = battery_data.get("secsleft") # Может быть None, int
+
+            if plugged is False: # Только если точно работает от батареи
+                # Проверяем заряд
+                if isinstance(charge, (int, float)) and charge < LOW_BATTERY_PERCENT:
+                    problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Низкий заряд батареи: {charge:.1f}% (Порог: <{LOW_BATTERY_PERCENT}%).")
+                    # Не добавляем в скор производительности по умолчанию
+
+                # Проверяем оставшееся время
+                # POWER_TIME_UNLIMITED = -1, POWER_TIME_UNKNOWN = -2
+                if isinstance(secs_left, int) and 0 < secs_left < (LOW_BATTERY_TIME_MIN * 60):
+                     time_left_str = format_timedelta(datetime.timedelta(seconds=secs_left))
+                     problems.append(f"[ПРЕДУПРЕЖДЕНИЕ] Мало времени работы от батареи: ~{time_left_str} (Порог: <{LOW_BATTERY_TIME_MIN} мин).")
+                     # Не добавляем в скор производительности по умолчанию
+
+            elif plugged is None: # Статус питания неизвестен
+                 problems.append(f"[ИНФО] Не удалось точно определить, подключено ли питание от сети.")
+            # else: # plugged is True - все ок, ничего не выводим
+
+        # --- Вывод результатов анализа ---
+        # (Этот блок кода завершает функцию analyze_system)
+        if problems:
+            print("Обнаружены потенциальные проблемы или важные замечания:")
+            # Сортируем: сначала критические, потом предупреждения, потом инфо
+            problems.sort(key=lambda x: (0 if "[КРИТИЧНО]" in x else 1 if "[ПРЕДУПРЕЖДЕНИЕ]" in x else 2))
+            for problem in problems:
+                print(f"  - {problem}")
+        else:
+            # Добавляем проверку, были ли вообще данные для анализа
+            if factors_count > 0:
+                print("Серьезных проблем с производительностью (CPU, RAM, Disk Space, Temp, I/O Wait) не обнаружено.")
+            else:
+                 print("Не удалось собрать достаточно данных для анализа производительности.")
+
+        # --- Расчет и вывод "уровня стресса" ---
+        if factors_count > 0:
+            # Нормализуем скор к ~100
+            # Делим общий скор на количество факторов (с учетом их весов)
+            overall_stress_percentage = stress_score / factors_count
+            # Ограничим сверху и снизу для разумных пределов
+            overall_stress_percentage = max(0.0, min(overall_stress_percentage, 100.0))
+
+            print(f"\nУсловный уровень нагрузки/риска системы: {overall_stress_percentage:.1f}%")
+            if overall_stress_percentage > 80:
+                print(">>> ВНИМАНИЕ! Система находится под очень высокой нагрузкой или имеет критические проблемы! <<<")
+            elif overall_stress_percentage > 60:
+                print(">>> Система находится под высокой нагрузкой или имеет существенные проблемы. <<<")
+            elif overall_stress_percentage > 40:
+                 print(">>> Система находится под умеренной нагрузкой или есть предупреждения. <<<")
+            else:
+                 print(">>> Уровень нагрузки системы в пределах нормы. <<<")
+        else:
+            # Это сообщение уже выведено выше, если не было данных
+            pass # print("\nНедостаточно данных для расчета уровня нагрузки.")
+
+        print("-" * 105)
+
+# --- Конец функции analyze_system ---
+
+
+# --- Основной блок выполнения ---
+# Важно: Этот блок предполагает, что все необходимые функции
+# (get_system_info, get_cpu_info, ..., get_battery_info, analyze_system)
+# были определены ВЫШЕ в этом же файле.
+
+if __name__ == "__main__":
+    # --- ВАЖНО: Эта часть ДОЛЖНА выполняться ПОСЛЕ всех определений функций ---
+    try:
+        # --- Сбор данных (вызов всех функций get_...) ---
+        # Эти вызовы должны быть здесь, если это полный скрипт
+        # Если это третья часть, то предполагается, что данные уже есть
+
+        # Пример ПОЛНОГО блока вызовов (если бы это был единый файл):
+        # print("Сбор информации о системе...")
+        # get_system_info()
+        # cpu_data = get_cpu_info()
+        # mem_data = get_memory_info()
+        # disk_data = get_disk_info()
+        # net_data = get_detailed_network_info() # Данные net_data пока не используются в analyze_system
+        # prog_versions = get_program_versions() # Данные prog_versions пока не используются в analyze_system
+        # sensor_readings = get_sensor_info()
+        # battery_status = get_battery_info()
+        # print("Сбор информации завершен.\n")
+
+        # --- Анализ (использует собранные данные) ---
+        # Убедитесь, что переменные cpu_data, mem_data, disk_data,
+        # sensor_readings, battery_status существуют и содержат данные.
+
+        # Проверка существования переменных (как в Части 2)
+        required_vars = ['cpu_data', 'mem_data', 'disk_data', 'sensor_readings', 'battery_status']
+        # Проверяем, определены ли переменные в локальной или глобальной области видимости
+        if all(var in locals() or var in globals() for var in required_vars):
+             # Используем данные, которые должны были быть получены ранее
+            analyze_system(cpu_data, mem_data, disk_data, sensor_readings, battery_status)
+        else:
+            print("\n[ОШИБКА ЗАПУСКА] Не найдены все необходимые данные для анализа.")
+            print(f">>> Убедитесь, что функции сбора данных (get_cpu_info, get_memory_info и т.д.) были вызваны перед analyze_system.")
+            missing = [v for v in required_vars if not (v in locals() or v in globals())]
+            print(f">>> Отсутствующие переменные: {', '.join(missing)}")
+            # Можно запустить анализ с пустыми данными для демонстрации структуры вывода:
+            # print("\n--- Запуск анализа с пустыми данными (для демонстрации) ---")
+            # analyze_system({}, {}, [], {}, None) # Передаем корректные типы пустых данных
+
+    except NameError as ne:
+         print(f"\n[ОШИБКА ЗАПУСКА] Переменная или функция не найдена: {ne}.")
+         print(">>> Убедитесь, что все части кода и все определения функций находятся в одном файле и выполняются последовательно.")
+    except Exception as e:
+        print(f"\n[КРИТИЧЕСКАЯ ОШИБКА] Произошла непредвиденная ошибка во время выполнения: {e}")
+        # Вывод стека вызовов для отладки
+        import traceback
+        traceback.print_exc()
+
+    # Пауза для Windows
+    if sys.platform == "win32":
+        try:
+             input("\nНажмите Enter для выхода...")
+        except EOFError:
+             pass # Происходит при запуске без интерактивной консоли
+        except KeyboardInterrupt:
+             print("\nВыход по запросу пользователя.")
